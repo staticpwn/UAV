@@ -1,0 +1,10 @@
+ipykernel
+iprogress
+ipywidgets
+pandas
+numpy
+scipy
+ADRpy
+airfoils
+xfoil
+ussa1976
