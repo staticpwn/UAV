@@ -3,6 +3,7 @@ import math
 import numpy as np
 from ADRpy import atmospheres as at
 import ussa1976
+from specs import *
 
 # functions
 
