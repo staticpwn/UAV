@@ -712,7 +712,7 @@ def tail_geometry(area_m2, aspect_ratio):
     return span_m, chord_m
 
 
-def stability_analysis(
+def _stability_analysis(
     chord_m,
     cg_m,
     tail_volume_coeff,
@@ -722,6 +722,34 @@ def stability_analysis(
 
     neutral_point_m = wing_le_position_m + 0.25 * chord_m + Vh * chord_m
     static_margin = (neutral_point_m - cg_m) / chord_m
+
+
+    return {
+        "neutral_point_m": neutral_point_m,
+        "static_margin": static_margin,
+    }
+
+def stability_analysis(
+    current_values,
+    assumed_and_set,
+    deflections_dict,
+    phase
+):
+    Vh = assumed_and_set['horizontal_tail_volume_coefficient']
+
+    phase_for_delta = ""
+    if ("cruise" in phase) or (phase == "loiter"):
+        phase_for_delta = "cruise"
+    elif phase in ["takeoff", "landing"]:
+        phase_for_delta = "takeoff"
+
+    cl_row = get_row_for_cl(deflections_dict[f"{phase_for_delta}_0"], current_values[f"{phase}_cl"])
+
+    wing_ac = current_values["wing_le_position_m"] + 0.25*current_values["chord_m"]
+    new_wing_ac = wing_ac - (cl_row['CM']/cl_row['CL']) * current_values["chord_m"]
+
+    neutral_point_m = new_wing_ac + Vh * current_values['tail_arm_m']
+    static_margin = (neutral_point_m - current_values[f"{phase}_cg_from_nose_m"]) / current_values['chord_m']
 
 
     return {
