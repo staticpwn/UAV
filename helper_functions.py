@@ -368,7 +368,7 @@ def calculate_Cn_beta_phase(current_values, hard_constraints, vt_airfoil_data, p
 
     airfoil_at_Re = vt_airfoil_data  # fallback
 
-    cl_alpha_vt_per_deg = get_cl_alpha_at(airfoil_at_Re, 0, delta=0.1)
+    cl_alpha_vt_per_deg = get_cl_alpha_at(airfoil_at_Re, 0, "CL",delta=0.1)
     cl_alpha_vt_per_rad = cl_alpha_vt_per_deg * (180 / np.pi)
 
     # Downwash/shielding factor
@@ -592,7 +592,7 @@ def get_coefficients_at_alpha(df, alpha):
     coeffs["alpha"] = alpha
     return coeffs
 
-def get_cl_alpha_at(df, alpha, delta=0.5):
+def get_cl_alpha_at(df, alpha, target_coeff, delta=0.5):
     """
     Approximates the local lift curve slope dCl/dα at a specified angle of attack.
 
@@ -613,11 +613,11 @@ def get_cl_alpha_at(df, alpha, delta=0.5):
         raise ValueError(f"Alpha ± delta must be within data bounds ({alpha_min} to {alpha_max})")
 
     # Interpolate CL at alpha ± delta
-    cl_plus = np.interp(alpha + delta, df["alpha"], df["CL"])
-    cl_minus = np.interp(alpha - delta, df["alpha"], df["CL"])
+    target_coeff_plus = np.interp(alpha + delta, df["alpha"], df[target_coeff])
+    target_coeff_minus = np.interp(alpha - delta, df["alpha"], df[target_coeff])
 
-    cl_alpha = (cl_plus - cl_minus) / (2 * delta)
-    return cl_alpha
+    target_coeff_alpha = (target_coeff_plus - target_coeff_minus) / (2 * delta)
+    return target_coeff_alpha
 
 def get_row_for_cl(df, target_cl):
     """
@@ -735,7 +735,6 @@ def stability_analysis(
     deflections_dict,
     phase
 ):
-    Vh = assumed_and_set['horizontal_tail_volume_coefficient']
 
     phase_for_delta = ""
     if ("cruise" in phase) or (phase == "loiter"):
@@ -746,11 +745,21 @@ def stability_analysis(
     cl_row = get_row_for_cl(deflections_dict[f"{phase_for_delta}_0"], current_values[f"{phase}_cl"])
 
     wing_ac = current_values["wing_le_position_m"] + 0.25*current_values["chord_m"]
-    new_wing_ac = wing_ac - (cl_row['CM']/cl_row['CL']) * current_values["chord_m"]
 
-    neutral_point_m = new_wing_ac + Vh * current_values['tail_arm_m']
-    static_margin = (neutral_point_m - current_values[f"{phase}_cg_from_nose_m"]) / current_values['chord_m']
+    coeff_ratio = get_cl_alpha_at(deflections_dict[f"{phase_for_delta}_0"], current_values['cruiseout_angle_of_attack_deg'], "CM", 0.1) / get_cl_alpha_at(deflections_dict[f"{phase_for_delta}_0"], current_values['cruiseout_angle_of_attack_deg'], "CL", 0.1)
+    # new_wing_ac = wing_ac - (cl_row['CM']/cl_row['CL']) * current_values["chord_m"]
+    new_wing_ac = wing_ac - coeff_ratio * current_values["chord_m"]
 
+    eta_h = calculate_eta_h(current_values, phase=phase)
+
+    # neutral_point_m = new_wing_ac + Vh * current_values['chord_m']
+    neutral_point_m = new_wing_ac + (eta_h * assumed_and_set["horizontal_tail_volume_coefficient"] * current_values["chord_m"] * (1-assumed_and_set["ht_downwash_efficiency_coeff"]))
+    # static_margin = (neutral_point_m - current_values[f"{phase}_cg_from_nose_m"]) / current_values['chord_m']
+
+    x_cg = current_values[f"{phase}_cg_from_nose_m"]
+    h_np = (neutral_point_m - current_values["wing_le_position_m"]) / current_values["chord_m"]
+    h_cg = (x_cg - current_values["wing_le_position_m"]) / current_values["chord_m"]
+    static_margin = h_np - h_cg
 
     return {
         "neutral_point_m": neutral_point_m,
