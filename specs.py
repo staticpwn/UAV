@@ -10,7 +10,7 @@ from ADRpy import atmospheres as at
 
 engine_specs = {
     "price": 13000,  # USD
-    "dry_weight_kg": 62.3,  # kg
+    "dry_weight_kg": 70,  # kg
     "max_power_kw": 59.6, # kW
     "max_rpm": 5800, # rpm
     "max_continuous_power_kw": 58, # kW
@@ -53,12 +53,13 @@ engine_sfc_to_rpm = { # sfc in kg/kWh vs rpm
 
 ## propeller specs - equivalent to rotax prop 3BO
 ## link https://www.sensenich.com/shop/aircraft/3-blade-rotax-ground-adjustable-propeller/
+## https://kievprop.com/
 
 propeller_specs = {
     "price": 2000,  # USD
     "diameter_m": 1.87,  # m
     "blade_count": 3,  # dimensionless
-    "weight_kg": 15,  # kg
+    "weight_kg": 4,  # kg
     "moment_of_inertia_kgm2": 0.8,  # kg*m^2
     "max_rpm": 2600,  # rpm
     "max_thrust_kgf" : 250, # kgf
