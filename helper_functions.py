@@ -170,7 +170,7 @@ def estimate_component_positions(current_values, hard_constraints, assumed_and_s
     full_dict = {
         "fuselage": (0.5 * current_values["fuselage_body_length_m"], 0.5*current_values["fuselage_body_height_m"]),
         "wing": (current_values["wing_le_position_m"] + 0.45 * current_values["chord_m"], assumed_and_set["wing_airfoil_thickness_ratio"] * current_values["chord_m"]),
-        "tails": (current_values["tail_arm_m"] + current_values["wing_le_position_m"] + 0.25 * current_values["chord_m"], tail_local_cg_z + current_values["tail_boom_pylon_height_m"]),
+        "tails": (current_values["x_ht_le_m"] + assumed_and_set["tail_mass_cg_from_le_coeff"]  * current_values["h_tail_chord_m"], tail_local_cg_z + current_values["tail_boom_pylon_height_m"]),
         # "tails": 0.9*fuselage_length,
         "engine": (current_values["fuselage_body_length_m"] * 0.95, 0.5*current_values["fuselage_body_height_m"]),
         "propeller": (current_values["fuselage_body_length_m"] * 1.0, 0.5*current_values["fuselage_body_height_m"] ),
@@ -201,19 +201,14 @@ def calculate_eta_h(current_values, phase='cruise'):
     - eta_h (float): Elevator effectiveness (typically 0.6–0.9)
     """
     # 1. Wing Aerodynamic Center (AC) at 25% MAC
-    wing_le_position = current_values["wing_le_position_m"]
     wing_chord = current_values["chord_m"]
-    wing_ac = wing_le_position + 0.25 * wing_chord
+    wing_ac = current_values[f"{phase}_x_ac_w_m"]
 
     # 2. Horizontal Tail Aerodynamic Center (AC)
     # Tail LE is located at: cg + tail_arm - ht_chord*0.25 (assuming tail measured from cg)
     # But in your code: tail_arm is from CG to tail LE → so:
-    cg_position = current_values["cruiseout_cg_from_nose_m"]
-    tail_arm = current_values["tail_arm_m"]
-    h_tail_chord = current_values["h_tail_chord_m"]
-    
-    h_tail_le_position = cg_position + tail_arm  # Tail LE relative to nose
-    ht_ac = h_tail_le_position + 0.25 * h_tail_chord  # HT AC
+
+    ht_ac = current_values[f"{phase}_x_ht_ac_m"]  # HT AC
 
     # 3. Moment Arm from Wing AC to HT AC
     tail_arm_ac_to_ac_m = ht_ac - wing_ac
@@ -669,6 +664,7 @@ def initial_design_feasibility_pass(current_values, assumed_and_set):
 
     # 2. Wing Loading
     current_values["wing_loading_pa"] = (mtow * g) / current_values["wing_area_m2"]
+    
 
     # 3. Wing Geometry
     AR = current_values["aspect_ratio"]
@@ -679,7 +675,7 @@ def initial_design_feasibility_pass(current_values, assumed_and_set):
     fuselage_length = assumed_and_set["fuselage_length_mac_coeff"] * current_values["chord_m"]
     current_values["fuselage_body_length_m"] = fuselage_length
     current_values["wing_le_position_m"] = assumed_and_set["wing_le_position_fuselage_length_coeff"] * fuselage_length
-
+    
     # 5. Tail Arm and Tail Areas
     tail_arm = assumed_and_set["horizontal_tail_arm_mac_coeff"] * current_values["chord_m"]
     current_values["tail_arm_m"] = tail_arm
@@ -742,7 +738,7 @@ def stability_analysis(
     elif phase in ["takeoff", "landing"]:
         phase_for_delta = "takeoff"
 
-    cl_row = get_row_for_cl(deflections_dict[f"{phase_for_delta}_0"], current_values[f"{phase}_cl"])
+    # cl_row = get_row_for_cl(deflections_dict[f"{phase_for_delta}_0"], current_values[f"{phase}_cl"])
 
     wing_ac = current_values["wing_le_position_m"] + 0.25*current_values["chord_m"]
 
@@ -754,12 +750,12 @@ def stability_analysis(
 
     # neutral_point_m = new_wing_ac + Vh * current_values['chord_m']
     neutral_point_m = new_wing_ac + (eta_h * assumed_and_set["horizontal_tail_volume_coefficient"] * current_values["chord_m"] * (1-assumed_and_set["ht_downwash_efficiency_coeff"]))
-    # static_margin = (neutral_point_m - current_values[f"{phase}_cg_from_nose_m"]) / current_values['chord_m']
+    static_margin = (neutral_point_m - current_values[f"{phase}_cg_from_nose_m"]) / current_values['chord_m']
 
-    x_cg = current_values[f"{phase}_cg_from_nose_m"]
-    h_np = (neutral_point_m - current_values["wing_le_position_m"]) / current_values["chord_m"]
-    h_cg = (x_cg - current_values["wing_le_position_m"]) / current_values["chord_m"]
-    static_margin = h_np - h_cg
+    # x_cg = current_values[f"{phase}_cg_from_nose_m"]
+    # h_np = (neutral_point_m - current_values["wing_le_position_m"]) / current_values["chord_m"]
+    # h_cg = (x_cg - current_values["wing_le_position_m"]) / current_values["chord_m"]
+    # static_margin = h_np - h_cg
 
     return {
         "neutral_point_m": neutral_point_m,
