@@ -22,6 +22,9 @@ engine_specs = {
     "specific_fuel_consumption": 0.285,  # kg/kWh
     "reduction_ratio": 2.43,  # dimensionless
     "gear_box_efficiency": 0.95,  # dimensionless
+    "length":0.6659,
+    "width": 0.5786,
+    "height": 0.4121, 
 }
 
 engine_altitude_performance = { # power in kw vs altitude in km
