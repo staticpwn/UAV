@@ -167,11 +167,12 @@ def estimate_component_positions(current_values, hard_constraints, assumed_and_s
     tail_local_cg_vt_z = weights_dict_kg_no_fuel["vertical_tail"] * current_values["v_tail_span_m"] / 2
     tail_local_cg_z = (tail_local_cg_ht_z + tail_local_cg_vt_z) / weights_dict_kg_no_fuel["tails"]
 
+    wing_vertical_position = current_values['high_wing_offset_m'] + (current_values['fuselage_body_height_m']/2)
     full_dict = {
         "fuselage": (0.5 * current_values["fuselage_body_length_m"], 
                      0.5*current_values["fuselage_body_height_m"]),
         "wing": (current_values["wing_le_position_m"] + 0.45 * current_values["chord_m"], 
-                 assumed_and_set["wing_airfoil_thickness_ratio"] * current_values["chord_m"]),
+                 wing_vertical_position),
         "tails": (current_values["x_ht_le_m"] + assumed_and_set["tail_mass_cg_from_le_coeff"]  * current_values["h_tail_chord_m"], 
                   tail_local_cg_z + current_values["tail_boom_pylon_height_m"]),
         # "tails": 0.9*fuselage_length,
@@ -409,7 +410,7 @@ def calculate_Cl_beta_phase(current_values, assumed_and_set, phase):
     # Design parameters (from assumed_and_set or defaults)
     dihedral_deg = assumed_and_set.get("dihedral_deg", 0.0)
     wing_sweep_deg = assumed_and_set.get("wing_sweep_deg", 0.0)
-    high_wing_offset_m = assumed_and_set.get("high_wing_offset_m", 0.0)
+    high_wing_offset_m = current_values.get("high_wing_offset_m", 0.0)
 
     # Flight condition
     cl = current_values[f"{phase}_cl"]
@@ -613,8 +614,8 @@ def get_cl_alpha_at(df, alpha, target_coeff, delta=0.5):
     """
     df = df.sort_values("alpha")
 
-    alpha_min = -5
-    alpha_max = 10
+    alpha_min = -15
+    alpha_max = 25
 
     if not (alpha_min <= alpha - delta and alpha + delta <= alpha_max):
         raise ValueError(f"Alpha ± delta must be within data bounds ({alpha_min} to {alpha_max})")
@@ -640,6 +641,7 @@ def get_row_for_cl(df, target_cl):
     df = df.sort_values("CL")
 
     if not (df["CL"].min() <= target_cl <= df["CL"].max()):
+        
         raise ValueError(f"CL = {target_cl} is out of bounds ({df['CL'].min()} to {df['CL'].max()})")
 
     # Find bracketing rows
