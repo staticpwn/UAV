@@ -641,7 +641,7 @@ def get_row_for_cl(df, target_cl):
     df = df.sort_values("CL")
 
     if not (df["CL"].min() <= target_cl <= df["CL"].max()):
-        
+
         raise ValueError(f"CL = {target_cl} is out of bounds ({df['CL'].min()} to {df['CL'].max()})")
 
     # Find bracketing rows
@@ -762,7 +762,7 @@ def stability_analysis(
 
     eta_h = calculate_eta_h(current_values, phase=phase)
 
-    # neutral_point_m = new_wing_ac + Vh * current_values['chord_m']
+    # neutral_point_m = current_values[f"{phase}_x_ac_w_m"] + assumed_and_set["horizontal_tail_volume_coefficient"] * current_values['chord_m']
     neutral_point_m = new_wing_ac + (eta_h * assumed_and_set["horizontal_tail_volume_coefficient"] * current_values["chord_m"] * (1-assumed_and_set["ht_downwash_efficiency_coeff"]))
     static_margin = (neutral_point_m - current_values[f"{phase}_cg_from_nose_m"]) / current_values['chord_m']
 
