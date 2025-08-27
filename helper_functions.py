@@ -182,7 +182,8 @@ def estimate_component_positions(current_values, hard_constraints, assumed_and_s
                    0.5*current_values["fuselage_body_height_m"]),
         "propeller": (current_values["fuselage_body_length_m"] * -0.05, 
                       0.5*current_values["fuselage_body_height_m"] ),
-        "internal_payload": (current_values["fuselage_body_length_m"] - 1 - (0.5*hard_constraints["internal_payload_length"]), 
+        # "internal_payload": (current_values["fuselage_body_length_m"] - 1 - (0.5*hard_constraints["internal_payload_length"]), 
+        "internal_payload": ((0.5*hard_constraints["internal_payload_length"]) + 1.2, 
                              0.35*current_values["fuselage_body_height_m"]),
         "wing_payload": (current_values["wing_le_position_m"] + 0.5 * current_values["chord_m"], 
                          -0.2*current_values["fuselage_body_height_m"]),
@@ -758,7 +759,7 @@ def stability_analysis(
 
     wing_ac = current_values["wing_le_position_m"] + 0.25*current_values["chord_m"]
 
-    coeff_ratio = get_cl_alpha_at(deflections_dict[f"{phase_for_delta}_0"], current_values['cruiseout_angle_of_attack_deg']  + assumed_and_set["wing_incident_angle"], "CM", 0.1) / get_cl_alpha_at(deflections_dict[f"{phase_for_delta}_0"], current_values['cruiseout_angle_of_attack_deg']  + assumed_and_set["wing_incident_angle"], "CL", 0.1)
+    coeff_ratio = get_cl_alpha_at(deflections_dict[f"{phase_for_delta}_0"], current_values[f'{phase}_angle_of_attack_deg']  + assumed_and_set["wing_incident_angle"], "CM", 0.1) / get_cl_alpha_at(deflections_dict[f"{phase_for_delta}_0"], current_values[f'{phase}_angle_of_attack_deg']  + assumed_and_set["wing_incident_angle"], "CL", 0.1)
     # new_wing_ac = wing_ac - (cl_row['CM']/cl_row['CL']) * current_values["chord_m"]
     new_wing_ac = wing_ac - coeff_ratio * current_values["chord_m"]
 
