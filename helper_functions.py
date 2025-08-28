@@ -183,7 +183,7 @@ def estimate_component_positions(current_values, hard_constraints, assumed_and_s
         "propeller": (current_values["fuselage_body_length_m"] * -0.05, 
                       0.5*current_values["fuselage_body_height_m"] ),
         # "internal_payload": (current_values["fuselage_body_length_m"] - 1 - (0.5*hard_constraints["internal_payload_length"]), 
-        "internal_payload": ((0.5*hard_constraints["internal_payload_length"]) + 1.2, 
+        "internal_payload": ((0.5*hard_constraints["internal_payload_length"]) + 1, 
                              0.35*current_values["fuselage_body_height_m"]),
         "wing_payload": (current_values["wing_le_position_m"] + 0.5 * current_values["chord_m"], 
                          -0.2*current_values["fuselage_body_height_m"]),
@@ -537,7 +537,7 @@ def airfoil_perimeter_length(x, y, chord):
     
     return total_length
 
-def get_wing_or_tail_mass(span, cross_section_perimeter_length, tail_or_wing, assumed_and_set):
+def _get_wing_or_tail_mass(span, cross_section_perimeter_length, tail_or_wing, assumed_and_set):
 
     
     skin_thickness = sandwich_specs[tail_or_wing]["total_thickness_m"] - sandwich_specs[tail_or_wing]["core_thickness_m"]
@@ -554,9 +554,24 @@ def get_wing_or_tail_mass(span, cross_section_perimeter_length, tail_or_wing, as
     core_density = assumed_and_set["core_density_kgm3"]
     total_core_mass = total_core_volume * core_density
 
+    print(f"skin mass: {total_skin_mass}")
+    print(f"core mass: {total_core_mass}")
+    
     total_wing_mass = total_skin_mass + total_core_mass
 
     return total_wing_mass
+
+def get_wing_or_tail_mass(surface_area, assumed_and_set, tail_or_wing):
+
+    k_wet = 2.1
+    core_factor = 0.75 # part of the wing that actually has a core requirement
+
+    skin_thickness = sandwich_specs[tail_or_wing]["total_thickness_m"] - sandwich_specs[tail_or_wing]["core_thickness_m"]
+    m_faces = k_wet * surface_area * skin_thickness * assumed_and_set["gfrp_density_kgm3"]
+    m_core = k_wet * core_factor * surface_area * sandwich_specs[tail_or_wing]["core_thickness_m"] * assumed_and_set["core_density_kgm3"]
+    
+    return m_core + m_faces  
+
 
 
 
@@ -780,6 +795,66 @@ def stability_analysis(
     }
 
 
+def _interp_col_vs_alpha(df, alpha_deg, col):
+    # df must have columns 'alpha' and the requested col
+    d = df.sort_values("alpha")
+    return float(np.interp(alpha_deg, d["alpha"].values, d[col].values))
+
+def CL_tail_bilinear(alpha_t_deg, delta_e_deg, deflections_dict, phase="cruise"):
+    """CL_t at (alpha_t, delta_e) by blending between two δe polars."""
+    # available deflection tables like 'cruise_-10', 'cruise_0', 'cruise_10', ...
+    defs = sorted(int(k.split("_")[1]) for k in deflections_dict if k.startswith(f"{phase}_"))
+    # bracket delta_e
+    j = np.searchsorted(defs, delta_e_deg)
+    
+    j0 = max(0, min(j-1, len(defs)-2))
+    j1 = j0 + 1
+    d0, d1 = defs[j0], defs[j1]
+    w = 0.0 if d1 == d0 else (delta_e_deg - d0) / (d1 - d0)
+
+    df0 = deflections_dict[f"{phase}_{d0}"]
+    df1 = deflections_dict[f"{phase}_{d1}"]
+
+    CL0 = _interp_col_vs_alpha(df0, alpha_t_deg, "CL")
+    CL1 = _interp_col_vs_alpha(df1, alpha_t_deg, "CL")
+    return (1.0 - w)*CL0 + w*CL1
+
+def solve_delta_e_for_CLt(CLt_req, alpha_t_deg, deflections_dict, phase="cruise",
+                          dmin=None, dmax=None, tol=1e-4, itmax=40):
+    """Robust 1-D solve for δe: CL_tail(alpha_t, δe) = CLt_req."""
+    defs = sorted(int(k.split("_")[1]) for k in deflections_dict if k.startswith(f"{phase}_"))
+    if dmin is None: dmin = defs[0]
+    if dmax is None: dmax = defs[-1]
+
+    # bracket
+    f_lo = CL_tail_bilinear(alpha_t_deg, dmin, deflections_dict, phase) - CLt_req
+    f_hi = CL_tail_bilinear(alpha_t_deg, dmax, deflections_dict, phase) - CLt_req
+
+    # if not bracketed (rare), nudge toward center
+    if f_lo*f_hi > 0:
+        x0 = 0.5*(dmin + dmax) - 5.0
+        x1 = 0.5*(dmin + dmax) + 5.0
+        f0 = CL_tail_bilinear(alpha_t_deg, x0, deflections_dict, phase) - CLt_req
+        for _ in range(itmax):
+            f1 = CL_tail_bilinear(alpha_t_deg, x1, deflections_dict, phase) - CLt_req
+            if abs(f1) < tol: return float(np.clip(x1, dmin, dmax))
+            denom = (f1 - f0) if abs(f1 - f0) > 1e-9 else 1e-9
+            x2 = x1 - f1*(x1 - x0)/denom
+            x0, f0, x1 = x1, f1, float(np.clip(x2, dmin, dmax))
+        return float(np.clip(x1, dmin, dmax))
+
+    # bisection
+    lo, hi = float(dmin), float(dmax)
+    for _ in range(itmax):
+        mid = 0.5*(lo + hi)
+        f_mid = CL_tail_bilinear(alpha_t_deg, mid, deflections_dict, phase) - CLt_req
+        if abs(f_mid) < tol: return mid
+        if f_lo * f_mid <= 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return 0.5*(lo + hi)
+
 def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints, deflections_dict, phase):
     """
     Computes wing CL, tail CL, wing/tail AoA and required elevator deflection
@@ -833,20 +908,21 @@ def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints,
     alpha_t = alpha_w * (1.0 - downwash_grad) + ht_inc
 
     # --- Build table of tail CL vs elevator deflection at this tail AoA ---
-    rows = {}
-    for de in range(-15, 31):
-        try:
-            coeffs = get_coefficients_at_alpha(deflections_dict[f"{phase_for_delta}_{de}"], alpha_t)
-            rows[de] = coeffs
-        except Exception:
-            pass
-    df = pd.DataFrame(rows).T
-    df.index = df.index.astype(int)
-    df['alpha'] = df.index
+    # rows = {}
+    # for de in range(-15, 31):
+    #     try:
+    #         coeffs = get_coefficients_at_alpha(deflections_dict[f"{phase_for_delta}_{de}"], alpha_t)
+    #         rows[de] = coeffs
+    #     except Exception:
+    #         pass
+    # df = pd.DataFrame(rows).T
+    # df.index = df.index.astype(int)
+    # df['alpha'] = df.index
 
     # --- Interpolate to find elevator deflection needed for CL_t ---
 
-    delta_e = get_row_for_cl(df, CL_t)["alpha"]
+    # delta_e = get_row_for_cl(df, CL_t)["alpha"]
+    delta_e = solve_delta_e_for_CLt(CL_t, alpha_t, deflections_dict, phase=phase_for_delta)
 
     return {
         "cl_wing": CL_w,
