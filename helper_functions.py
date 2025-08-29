@@ -931,3 +931,87 @@ def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints,
         "alpha_tail_deg": alpha_t,
         "delta_elevator_deg": delta_e,
     }
+
+
+def required_wing_area_consistent(cur, assumed_and_set, hard_constraints,
+                                  weights_dict_kg_no_fuel,
+                                  phase):
+    """
+    Return the required wing area [m^2] for the given phase, consistently:
+      - takeoff:  S = W_TO / (q_TO * CL_max)           (tail ignored at stall)
+      - cruise/loiter/back: S solves W = q*(Sw*CLw + q*eta_h*Sh*CLt),
+        using Sh/Sw from tail volume: Sh/Sw = Vh * c_bar / l_t
+
+    Expects in `cur` (from your iteration): 
+      speeds per phase, chord_m, tail_arm_m, 
+      cl per phase (wing), cl_tail_required per phase (tail), etc.
+    """
+
+    # --- helpers ---
+    def phase_weight_kg(phase):
+        # payload is zero on cruiseback, present otherwise
+        payload_internal = weights_dict_kg_no_fuel.get("internal_payload", 0.0) if phase != "cruiseback" else 0.0
+        payload_wing     = weights_dict_kg_no_fuel.get("wing_payload", 0.0)     if phase != "cruiseback" else 0.0
+
+        return (weights_dict_kg_no_fuel["fuselage"] +
+                weights_dict_kg_no_fuel["wing"] +
+                weights_dict_kg_no_fuel["tails"] +
+                weights_dict_kg_no_fuel["engine"] +
+                weights_dict_kg_no_fuel["propeller"] +
+                weights_dict_kg_no_fuel["avionics"] +
+                weights_dict_kg_no_fuel["landing_gear"] +
+                weights_dict_kg_no_fuel["misc"] +
+                cur.get("fuselage_fuel", 0.0) +
+                cur.get("wing_fuel", 0.0) +
+                payload_internal + payload_wing)
+
+    def q_dyn(alt_m, V_kmh):
+        rho = get_air_density(alt_m)
+        V   = kmh_to_ms(V_kmh)
+        return 0.5 * rho * V**2
+
+    # --- phase setup ---
+    if phase.lower() in ("takeoff", "stall"):
+        q = q_dyn(0.0, hard_constraints["stall_speed_kmh"])
+        W = phase_weight_kg("takeoff") * g
+        CLmax = hard_constraints["CL_max"]
+        if CLmax <= 0:
+            raise ValueError("CL_max must be > 0 for takeoff sizing.")
+        return W / (q * CLmax)
+
+    # cruise/loiter/cruiseback: include tail contribution via Vh
+    phase = phase.lower()
+    if phase not in ("cruiseout", "loiter", "cruiseback"):
+        raise ValueError(f"Unknown phase '{phase}'.")
+
+    # dynamic pressure at cruise altitude with phase speed
+    q = q_dyn(hard_constraints["cruise_altitude_m"], cur[f"{phase}_speed_kmh"])
+    W = phase_weight_kg(phase) * g
+
+    # wing & tail CLs from your converged state
+    CLw = cur.get(f"{phase}_cl", None)
+    CLt = cur.get(f"{phase}_cl_tail_required", 0.0)  # default 0 if missing
+    if CLw is None:
+        raise KeyError(f"{phase}_cl not found in `cur`.")
+
+    # geometry/volume terms
+    Vh   = assumed_and_set["horizontal_tail_volume_coefficient"]  # (l_t * S_h) / (S_w * c_bar)
+    lt   = cur["tail_arm_m"]
+    cbar = cur["chord_m"]
+    if lt <= 0 or cbar <= 0:
+        raise ValueError("tail_arm_m and chord_m must be > 0.")
+
+    # Sh/Sw from Vh and current geometry (no need to know Sw explicitly)
+    Sh_over_Sw = Vh * cbar / lt
+
+    # dynamic pressure ratio at tail
+    eta_h = calculate_eta_h(cur, phase=phase)
+
+    # denominator for Sw; guard against non-physical values
+    denom = (CLw + eta_h * Sh_over_Sw * CLt)
+    if denom <= 1e-9:
+        # If tail downforce is very large (or CLw tiny), you could hit denom≈0.
+        # In that edge case, ignore tail for sizing to avoid division blow-up.
+        denom = max(CLw, 1e-6)
+
+    return W / (q * denom)
