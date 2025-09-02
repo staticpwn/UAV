@@ -180,10 +180,11 @@ def estimate_component_positions(current_values, hard_constraints, assumed_and_s
         # "tails": 0.9*fuselage_length,
         "engine": (current_values["fuselage_body_length_m"] * 0.0 + 0.5*engine_specs["length"], 
                    0.5*current_values["fuselage_body_height_m"]),
-        "propeller": (current_values["fuselage_body_length_m"] * -0.05, 
+        "propeller": (-0.2, 
                       0.5*current_values["fuselage_body_height_m"] ),
+
         # "internal_payload": (current_values["fuselage_body_length_m"] - 1 - (0.5*hard_constraints["internal_payload_length"]), 
-        "internal_payload": ((0.5*hard_constraints["internal_payload_length"]) + 1, 
+        "internal_payload": ((0.5*hard_constraints["internal_payload_length"]) + 1.5, 
                              0.35*current_values["fuselage_body_height_m"]),
         "wing_payload": (current_values["wing_le_position_m"] + 0.5 * current_values["chord_m"], 
                          -0.2*current_values["fuselage_body_height_m"]),
@@ -719,6 +720,34 @@ def initial_design_feasibility_pass(current_values, assumed_and_set):
     return current_values
 
 
+def get_cm_thrust(current_values, hard_constraints, phase):
+
+    phase_for_cg = ""
+
+    if ("cruise" in phase) or (phase == "loiter"):
+        phase_for_cg = phase
+        alt = hard_constraints["cruise_altitude_m"]
+        v_ms = kmh_to_ms(current_values[f"{phase_for_cg}_speed_kmh"])
+        power_kw = current_values[f"{phase_for_cg}_power_kw"] 
+    else:
+        phase_for_cg = "cruiseout"
+        alt = 0
+        v_ms = 1.2 * kmh_to_ms(hard_constraints[f"stall_speed_kmh"])
+        power_kw = engine_specs.get("max_continuous_power_kw")
+
+    rho = get_air_density(alt)
+    
+    q = 0.5 * rho * v_ms**2
+
+    # 4. Tail area (needed to convert moment to tail lift)
+    S = current_values["wing_area_m2"]
+    thrust = power_kw * 1000 / v_ms  # in N
+    moment_thrust = - thrust * (0.5*current_values["fuselage_body_height_m"] - current_values[f"{phase_for_cg}_cg_from_floor_m"])  # in Nm
+
+    cm_thrust = moment_thrust / (rho * v_ms**2 * S * current_values["chord_m"])
+
+    return cm_thrust
+
 def get_delt_cl_from_thrust(current_values, hard_constraints, phase):
     
 
@@ -855,7 +884,7 @@ def solve_delta_e_for_CLt(CLt_req, alpha_t_deg, deflections_dict, phase="cruise"
             lo, f_lo = mid, f_mid
     return 0.5*(lo + hi)
 
-def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints, deflections_dict, phase):
+def _closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints, deflections_dict, phase):
     """
     Computes wing CL, tail CL, wing/tail AoA and required elevator deflection
     for a given flight phase using closed-form trim equations.
@@ -907,18 +936,6 @@ def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints,
     # --- Tail AoA seen by the tail (include downwash) ---
     alpha_t = alpha_w * (1.0 - downwash_grad) + ht_inc
 
-    # --- Build table of tail CL vs elevator deflection at this tail AoA ---
-    # rows = {}
-    # for de in range(-15, 31):
-    #     try:
-    #         coeffs = get_coefficients_at_alpha(deflections_dict[f"{phase_for_delta}_{de}"], alpha_t)
-    #         rows[de] = coeffs
-    #     except Exception:
-    #         pass
-    # df = pd.DataFrame(rows).T
-    # df.index = df.index.astype(int)
-    # df['alpha'] = df.index
-
     # --- Interpolate to find elevator deflection needed for CL_t ---
 
     # delta_e = get_row_for_cl(df, CL_t)["alpha"]
@@ -929,6 +946,88 @@ def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints,
         "cl_tail_required": CL_t,
         "alpha_wing_deg": alpha_w,
         "alpha_tail_deg": alpha_t,
+        "delta_elevator_deg": delta_e,
+    }
+
+def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints, deflections_dict, phase):
+    """
+    Computes wing CL, tail CL, wing/tail AoA and required elevator deflection
+    for a given flight phase using real moment equilibrium (uses Cm_wing).
+    """
+    # --- Normalise phase naming ---
+    if ("cruise" in phase) or (phase == "loiter"):
+        phase_for_delta = "cruise"
+        rho = get_air_density(hard_constraints["cruise_altitude_m"])
+    elif phase in ["takeoff", "landing"]:
+        phase_for_delta = "takeoff"
+        rho = get_air_density(0.0)
+    else:
+        phase_for_delta = "cruise"
+        rho = get_air_density(hard_constraints["cruise_altitude_m"])
+
+    # --- Pull values from dicts ---
+    # Use per-phase mass if you have it; otherwise this falls back to mtow (not ideal)
+    m   = current_values.get(f"{phase}_mass_kg", current_values["mtow"])
+    V   = kmh_to_ms(current_values[f"{phase}_speed_kmh"])
+    Sw  = current_values["wing_area_m2"]
+    Sh  = current_values["horizontal_tail_area_m2"]
+    c   = current_values["chord_m"]
+    lt  = current_values["tail_arm_m"]
+    q   = 0.5 * rho * V**2
+    W   = m * 9.81
+
+    # Incidences and downwash
+    i_w   = float(assumed_and_set.get("wing_incident_angle", 0.0))
+    i_h   = float(assumed_and_set.get("ht_incident_angle",   0.0))
+    deda  = float(assumed_and_set.get("ht_downwash_efficiency_coeff", 0.3))  # dε/dα
+    eta_h = current_values.get("tail_dynamic_pressure_ratio", 1.0)           # q_t / q
+
+    # --- First pass: wing-only CL to get the wing operating point ---
+    CL_w = W / (q * Sw)   # initial guess (tail force not yet removed)
+
+    # Wing AC x-location (m from nose); prefer phase-specific if available
+    x_ac_w = current_values.get(f"{phase}_x_ac_w_m",
+                                current_values["wing_le_position_m"] + 0.25 * c)
+    x_cg   = current_values[f"{phase}_cg_from_nose_m"]
+
+    # --- Wing AoA & Cm_wing from polar at this CL_w ---
+    row_w   = get_row_for_cl(deflections_dict[f"{phase_for_delta}_0"], CL_w)
+    alpha_w = float(row_w["alpha"]) - i_w       # body AoA (deg)
+    Cm_w    = float(row_w["CM"])                # THIS is the Cm_wing you asked about
+
+    # Tail local α (deg) after downwash plus tail incidence
+    alpha_t = (1.0 - deda) * alpha_w + i_h
+
+    # --- Moment equilibrium about CG: solve for CL_t (THIS is where Cm_wing enters) ---
+    d_w   = (x_ac_w - x_cg) / c
+    denom = eta_h * (Sh/Sw) * (lt/c)
+    if abs(denom) < 1e-9:
+        raise ValueError("Tail moment denominator nearly zero (check lt, Sh, eta_h).")
+
+    Cm_fuse   = 0.0                 # add if you have it
+    Cm_thrust = get_cm_thrust(current_values, hard_constraints, phase)                 # add if you model thrust pitching moment
+
+    CL_t = - (Cm_w + CL_w * d_w + Cm_fuse + Cm_thrust) / denom
+
+    # Optional: refine CL_w by removing the tail lift from force balance (one correction step)
+    L_tail = (eta_h * q) * Sh * CL_t
+    CL_w = (W - L_tail) / (q * Sw)
+
+    # Re-read wing polar and Cm if you want a second, tighter pass:
+    row_w   = get_row_for_cl(deflections_dict[f"{phase_for_delta}_0"], CL_w)
+    alpha_w = float(row_w["alpha"]) - i_w
+    Cm_w    = float(row_w["CM"])
+    alpha_t = (1.0 - deda) * alpha_w + i_h
+    # (You could recompute CL_t again with the updated CL_w if desired.)
+
+    # --- Elevator deflection to achieve CL_t at alpha_t ---
+    delta_e = solve_delta_e_for_CLt(CL_t, alpha_t, deflections_dict, phase=phase_for_delta)
+
+    return {
+        "cl_wing": CL_w,
+        "cl_tail_required": CL_t,
+        "alpha_wing_deg": alpha_w,   # body AoA
+        "alpha_tail_deg": alpha_t,   # tail local geometric AoA
         "delta_elevator_deg": delta_e,
     }
 
