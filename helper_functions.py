@@ -1012,7 +1012,7 @@ def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints,
     # Optional: refine CL_w by removing the tail lift from force balance (one correction step)
     L_tail = (eta_h * q) * Sh * CL_t
     CL_w = (W - L_tail) / (q * Sw)
-
+#06-5188286
     # Re-read wing polar and Cm if you want a second, tighter pass:
     row_w   = get_row_for_cl(deflections_dict[f"{phase_for_delta}_0"], CL_w)
     alpha_w = float(row_w["alpha"]) - i_w
