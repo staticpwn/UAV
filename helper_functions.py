@@ -107,7 +107,7 @@ def calc_cl_cruise(mtow_kg, v_kmh, wing_area_m2, altitude_m):
     return cl
 
 # --- 3. Estimate Drag Coefficient using parabolic drag polar ---
-def calc_cd_total(cd0, cl, aspect_ratio, e=0.8):
+def calc_cd_total(cd0, cl, aspect_ratio, e):
     k = 1 / (np.pi * e * aspect_ratio)
     return cd0 + k * cl**2
 
@@ -1118,10 +1118,8 @@ def required_wing_area_consistent(cur, assumed_and_set, hard_constraints,
 
 def effective_CLmax_partial_span(
     deflections_dict,
-    phase_prefix="takeoff",            # "takeoff" polars are preferred; fall back to "cruise"
-    flap_deflection_deg=20,
-    flap_span_fraction=0.50,          # b_flap / b_wing
-    spanwise_flap_effectiveness=0.95, # ≤1.0
+    assumed_and_set,
+    phase_prefix="takeoff",
     alpha_margin_deg=0.0              # optional: back off a little from the formal max if desired
 ):
     """
@@ -1139,6 +1137,10 @@ def effective_CLmax_partial_span(
       3) Take the maximum CL_eff over that α grid. Optionally subtract a safety margin.
     """
     import numpy as np
+
+    flap_deflection_deg = assumed_and_set["flap_deflection_deg"]
+    flap_span_fraction = assumed_and_set["flap_span_fraction"]
+    spanwise_flap_effectiveness = assumed_and_set["spanwise_flap_effectiveness"]
 
     lam = max(0.0, min(1.0, spanwise_flap_effectiveness * flap_span_fraction))
 
@@ -1199,519 +1201,208 @@ def effective_CLmax_partial_span(
 
     return {"CLmax_eff": CL_star, "CD_at_CLmax_eff": CD_star, "CM_at_CLmax_eff" : CM_star, "alpha_at_CLmax_deg": a_star, "lambda_eff": lam}
 
-import numpy as np
-
-def _sorted_map_arrays(engine_power_to_rpm, engine_sfc_to_rpm):
-    """Convert your dicts (string keys) into sorted numeric arrays by RPM."""
-    # Ensure numeric, sorted by rpm
-    rpms = np.array(sorted([int(k) for k in engine_power_to_rpm.keys()]), dtype=float)
-    PkW = np.array([float(engine_power_to_rpm[str(int(r))]) for r in rpms], dtype=float)
-    SFC = np.array([float(engine_sfc_to_rpm[str(int(r))])     for r in rpms], dtype=float)
-    # Sanity (same RPM grid)
-    if len(SFC) != len(PkW):
-        raise ValueError("Power and SFC maps have different lengths.")
-    return rpms, PkW, SFC
-
-def make_engine_interpolants(engine_power_to_rpm, engine_sfc_to_rpm):
-    """
-    Returns callables:
-      P_of_rpm(rpm) [kW], SFC_of_rpm(rpm) [kg/kWh], rpm_for_power(P_req_kw) [rpm]
-    Monotonic piecewise-linear; extrapolation is clamped to map edges.
-    """
-    rpms, PkW, SFC = _sorted_map_arrays(engine_power_to_rpm, engine_sfc_to_rpm)
-
-    # Forward: P(rpm), SFC(rpm)
-    def _interp_clamped(x, x_arr, y_arr):
-        x = np.asarray(x, dtype=float)
-        x_clamped = np.clip(x, x_arr[0], x_arr[-1])
-        return np.interp(x_clamped, x_arr, y_arr)
-
-    def P_of_rpm(rpm):
-        return _interp_clamped(rpm, rpms, PkW)
-
-    def SFC_of_rpm(rpm):
-        return _interp_clamped(rpm, rpms, SFC)
-
-    # Inverse: rpm(P) — guard monotonicity
-    if not np.all(np.diff(PkW) > 0.0):
-        # If the power curve has flats/noise, add tiny epsilon to enforce strict monotone
-        eps = 1e-6 * np.arange(len(PkW))
-        PkW_mono = PkW + eps
-    else:
-        PkW_mono = PkW.copy()
-
-    def rpm_for_power(P_req_kw):
-        """Minimum RPM that can supply at least P_req_kw; clamps to ends."""
-        P = float(P_req_kw)
-        if P <= PkW_mono[0]:
-            return rpms[0]
-        if P >= PkW_mono[-1]:
-            return rpms[-1]
-        return float(np.interp(P, PkW_mono, rpms))
-
-    return P_of_rpm, SFC_of_rpm, rpm_for_power
-
-def engine_available_power_kw_at_alt(rpm, engine_specs, sigma, use_max=True):
-    """
-    Apply altitude derate to map power (sea-level map → altitude).
-    If turbo_normalized up to critical altitude, hold power.
-    engine_specs expects:
-      - "altitude_power_exponent" (default 1.0)
-      - "turbo_normalized" (bool), "critical_altitude_m"
-    """
-    expo = float(engine_specs.get("altitude_power_exponent", 1.0))
-    turbo = bool(engine_specs.get("turbo_normalized", False))
-    crit  = float(engine_specs.get("critical_altitude_m", 0.0))
-    # rpm power at sea level:
-    # caller provides base P_of_rpm(rpm) separately; this function only scales with σ if needed
-    # We keep this scaler here for clarity:
-    if turbo and sigma < 1.0 and crit > 0:
-        # Caller should pass sigma at the altitude. If below crit-alt, sigma≈1 scaling (i.e., no derate).
-        pass
-    scale = 1.0 if (turbo and crit > 0 and sigma < 1.0) else (sigma ** expo)
-    return scale  # multiply this on top of sea-level P_of_rpm(rpm)
-
-def choose_engine_setting_for_climb(cur, V_ms, altitude_m, mode, 
-                                    engine_specs, propeller_specs,
-                                    P_of_rpm, SFC_of_rpm, rpm_for_power,
-                                    eta_gb=1.0, sigma=None, P_req_air_w=None,
-                                    rpm_limits=(3000.0, 5500.0)):
-    """
-    Decide RPM and compute:
-      - P_shaft_kw at that RPM (after altitude derate),
-      - SFC (kg/kWh) at that RPM,
-      - P_avail_to_air_w = η_p(V)*η_gb*P_shaft_kw*1000
-    Modes:
-      - "max_rate": pick rpm_max → max P_shaft → best ROC.
-      - "min_sfc_at_required": deliver at least P_req_air_w to the AIR and minimize SFC.
-        Requires P_req_air_w (from drag*speed) and prop efficiency for conversion.
-    """
-    # Atmosphere scaling
-    if sigma is None:
-        rho = get_air_density(altitude_m)
-        sigma = rho / get_air_density(0.0)
-
-    # Prop efficiency vs V: reuse your linear blend approach
-    eta_takeoff = propeller_specs["efficiency"].get("takeoff", propeller_specs["efficiency"].get("take-off", 0.75))
-    eta_cruise  = propeller_specs["efficiency"].get("cruise", eta_takeoff)
-    Vc_ms = kmh_to_ms(cur.get("cruiseout_speed_kmh", 150.0))
-    t = max(0.0, min(1.0, V_ms / max(Vc_ms, 1.0)))
-    eta_p = (1.0 - t) * eta_takeoff + t * eta_cruise
-
-    rpm_min, rpm_max = rpm_limits
-
-    if mode == "max_rate":
-        rpm = rpm_max
-        P_sea_kw = P_of_rpm(rpm)
-        scale = engine_available_power_kw_at_alt(rpm, engine_specs, sigma)
-        P_shaft_kw = P_sea_kw * scale
-        sfc = SFC_of_rpm(rpm)
-        P_air_w = eta_p * eta_gb * P_shaft_kw * 1000.0
-        return {"rpm": rpm, "P_shaft_kw": P_shaft_kw, "sfc_kg_per_kwh": sfc,
-                "eta_p": eta_p, "P_avail_air_w": P_air_w}
-
-    elif mode == "min_sfc_at_required":
-        if P_req_air_w is None:
-            raise ValueError("P_req_air_w must be provided for mode='min_sfc_at_required'")
-        # Required shaft power to deliver P_req_air_w to AIR:
-        P_req_shaft_kw = P_req_air_w / max(eta_p * eta_gb, 1e-6) / 1000.0
-        # Find the minimum RPM that can deliver ≥ this shaft power (after altitude derate).
-        # We’ll iterate a bit because derate depends on sigma^expo but not on rpm in our model.
-        rpm_guess = rpm_for_power(P_req_shaft_kw)  # sea level
-        rpm = float(np.clip(rpm_guess, rpm_min, rpm_max))
-        # Ensure enough after derate; if not, push to higher rpm
-        for _ in range(3):
-            P_sea_kw = P_of_rpm(rpm)
-            scale = engine_available_power_kw_at_alt(rpm, engine_specs, sigma)
-            if P_sea_kw * scale >= P_req_shaft_kw or rpm >= rpm_max - 1.0:
-                break
-            # push rpm up proportionally
-            rpm = float(np.clip(rpm + 200.0, rpm_min, rpm_max))
-
-        # Among feasible RPMs (± a small neighborhood), pick the one with min SFC
-        candidates = np.clip(np.array([rpm-200, rpm, rpm+200, rpm+400]), rpm_min, rpm_max)
-        best = None
-        for r in np.unique(candidates):
-            P_sea_kw = P_of_rpm(r)
-            scale = engine_available_power_kw_at_alt(r, engine_specs, sigma)
-            P_shaft_kw = P_sea_kw * scale
-            if P_shaft_kw < P_req_shaft_kw: 
-                continue
-            sfc = SFC_of_rpm(r)
-            if (best is None) or (sfc < best["sfc_kg_per_kwh"]):
-                best = {"rpm": float(r), "P_shaft_kw": float(P_shaft_kw), "sfc_kg_per_kwh": float(sfc)}
-        if best is None:
-            # Not enough power at any rpm → fall back to max rpm (infeasible warning handled upstream)
-            r = rpm_max
-            P_shaft_kw = P_of_rpm(r) * engine_available_power_kw_at_alt(r, engine_specs, sigma)
-            best = {"rpm": r, "P_shaft_kw": P_shaft_kw, "sfc_kg_per_kwh": SFC_of_rpm(r)}
-
-        best["eta_p"] = eta_p
-        best["P_avail_air_w"] = eta_p * eta_gb * best["P_shaft_kw"] * 1000.0
-        return best
-
-    else:
-        raise ValueError("mode must be 'max_rate' or 'min_sfc_at_required'")
-
-
-def compute_time_to_altitude_with_engine_maps(
-    cur, assumed_and_set, hard_constraints, deflections_dict,
-    engine_power_to_rpm, engine_sfc_to_rpm,
-    target_altitude_m=None, start_altitude_m=0.0, altitude_slices=24,
-    climb_phase_prefix="takeoff",          # "takeoff" (flaps) or "cruise" (clean)
-    operate_mode="max_rate",               # "max_rate" or "min_sfc_at_required"
-    include_tail_drag=True
+def effective_CD0_partial_span(
+    deflections_dict,
+    assumed_and_set,
+    phase_prefix="takeoff",
+    alpha_bounds_deg=(-8.0, 18.0),
+    tol=1e-5, max_iter=40
 ):
     """
-    March to the target altitude; at each slice, find Vy by maximizing ROC(V).
-    Uses your power/SFC vs RPM maps.
-
-    Returns:
-      { "time_to_altitude_s": ..., "profile": [per-slice dicts], "roc_curves": {...} }
+    CD0 for partial-span flaps by blending clean/flapped polars at the SAME alpha,
+    then solving CL_eff(alpha0)=0 and reading CD_eff(alpha0).
+    Returns: {"CD0_eff": float, "alpha_at_CL0_deg": float, "lambda_eff": float}
     """
-    import math
-    g = 9.81
 
-    # Build engine interpolants (power & SFC vs RPM, plus inverse)
-    P_of_rpm, SFC_of_rpm, rpm_for_power = make_engine_interpolants(engine_power_to_rpm, engine_sfc_to_rpm)
+    flap_deflection_deg = assumed_and_set["flap_deflection_deg"]
+    flap_span_fraction = assumed_and_set["flap_span_fraction"]
+    spanwise_flap_effectiveness = assumed_and_set["spanwise_flap_effectiveness"]
 
-    # Geometry/airframe data
-    wing_planform_area_m2 = float(cur["wing_area_m2"])
-    horizontal_tail_area_m2 = float(cur["horizontal_tail_area_m2"])
-    mean_aerodynamic_chord_m = float(cur["chord_m"])
-    tail_arm_m = float(cur["tail_arm_m"])
-    aspect_ratio_wing = float(assumed_and_set.get("aspect_ratio", 12.0))
-    aspect_ratio_tail = float(assumed_and_set.get("AR_horizontal", 4.0))
-    oswald_wing = 0.85
-    oswald_tail = 0.80
-    induced_k_wing = 1.0 / (math.pi * aspect_ratio_wing * oswald_wing)
-    induced_k_tail = 1.0 / (math.pi * aspect_ratio_tail * oswald_tail)
+    lam = max(0.0, min(1.0, spanwise_flap_effectiveness * flap_span_fraction))
+    base_key = f"{phase_prefix}_0" if f"{phase_prefix}_0" in deflections_dict else "cruise_0"
+    flap_key = f"{phase_prefix}_{int(flap_deflection_deg)}"
 
-    # Incidence and downwash
-    wing_incidence_deg = float(assumed_and_set.get("wing_incident_angle", 0.0))
-    tail_incidence_deg = float(assumed_and_set.get("ht_incident_angle",   0.0))
-    downwash_deda = float(assumed_and_set.get("ht_downwash_efficiency_coeff", 0.30))
-    one_minus_deda = 1.0 - downwash_deda
+    if flap_key not in deflections_dict:
+        row0 = get_row_for_cl(deflections_dict[base_key], 0.0)
+        return {"CD0_eff": float(row0["CD"]), "alpha_at_CL0_deg": float(row0["alpha"]), "lambda_eff": 0.0}
 
-    # Mass at climb start (you can add fuel burn inside the loop if desired)
-    mass_kg = cur.get("climb_mass_kg", cur.get("mtow"))
-    weight_N = mass_kg * g
+    def coeffs_at_alpha(alpha_deg):
+        rc = get_coefficients_at_alpha(deflections_dict[base_key], alpha_deg)
+        rf = get_coefficients_at_alpha(deflections_dict[flap_key], alpha_deg)
+        blend = lambda a, b: (1.0 - lam)*a + lam*b
+        return {"CL": blend(rc["CL"], rf["CL"]), "CD": blend(rc["CD"], rf["CD"])}
 
-    # Phase-dependent CG and wing AC (fallbacks)
-    xcg_m = cur.get("climb_cg_from_nose_m", cur.get("cruiseout_cg_from_nose_m"))
-    x_ac_wing_m = cur.get("climb_x_ac_w_m", cur.get("cruiseout_x_ac_w_m",
-                        cur["wing_le_position_m"] + 0.25 * mean_aerodynamic_chord_m))
+    lo, hi = alpha_bounds_deg
+    def f(a): return coeffs_at_alpha(a)["CL"]
 
-    # Engine/prop efficiencies & altitude derate
-    eta_gbx = float(engine_specs.get("gear_box_efficiency", 1.0))
-    eta_takeoff = propeller_specs["efficiency"].get("takeoff", propeller_specs["efficiency"].get("take-off", 0.75))
-    eta_cruise  = propeller_specs["efficiency"].get("cruise", eta_takeoff)
-
-    turbo_norm = bool(engine_specs.get("turbo_normalized", False))
-    critical_alt_m = float(engine_specs.get("critical_altitude_m", 0.0))
-    power_exponent_sigma = float(engine_specs.get("altitude_power_exponent", 1.0))
-
-    def density_ratio_sigma(h_m):
-        return get_air_density(h_m) / get_air_density(0.0)
-
-    def altitude_power_scale(sigma):
-        if turbo_norm and critical_alt_m > 0:
-            # Flat to critical altitude (simple model)
-            return 1.0
-        return sigma ** power_exponent_sigma
-
-    def prop_efficiency_vs_speed(V_ms):
-        V_cruise_ms = kmh_to_ms(cur.get("cruiseout_speed_kmh", 150.0))
-        t = max(0.0, min(1.0, V_ms / max(1.0, V_cruise_ms)))
-        return (1.0 - t) * eta_takeoff + t * eta_cruise
-
-    # Clean CD0 baseline for the chosen climb phase
-    try:
-        CD0_phase = float(get_row_for_cl(deflections_dict[f"{climb_phase_prefix}_0"], 0.0)["CD"])
-    except Exception:
-        CD0_phase = float(get_row_for_cl(deflections_dict["cruise_0"], 0.0)["CD"])
-
-    # Wing-tail trim & drag at (V, h)
-    def trimmed_drag_and_power_required(V_ms, altitude_m):
-        rho = get_air_density(altitude_m)
-        Q = 0.5 * rho * V_ms * V_ms
-
-        # Initial guess: wing CL from lift = weight; refine with tail moment balance
-        CL_wing = weight_N / (Q * wing_planform_area_m2)
-
-        # Under-relaxed two-step: (wing CM + thrust CM) balanced by tail lift moment
-        for _ in range(3):
-            # Find wing α that yields CL_wing on the selected phase polar (clean if "cruise", flapped if "takeoff")
-            alpha_wing_deg = get_row_for_cl(deflections_dict[f"{climb_phase_prefix}_0"], CL_wing)["alpha"] - wing_incidence_deg
-
-            # Tail local α including downwash
-            alpha_tail_deg = one_minus_deda * alpha_wing_deg + tail_incidence_deg
-
-            # Wing section CM from polar at that α (phase polar)
-            row_w = get_coefficients_at_alpha(deflections_dict[f"{climb_phase_prefix}_0"], alpha_wing_deg + wing_incidence_deg)
-            Cm_wing = float(row_w["CM"])
-
-            # Thrust moment about CG (vertical offset): sign nose-down if thrust above CG
-            thrustline_z_m = float(cur.get("thrustline_z_from_floor_m", 0.0))
-            z_cg_m = float(cur.get("climb_cg_from_floor_m", cur.get("cruiseout_cg_from_floor_m", 0.0)))
-            # Use power available estimate to the AIR for the moment; small effect on CLt
-            eta_p = prop_efficiency_vs_speed(V_ms)
-            # Pick an RPM near the top (max-rate default)
-            rpm_top = max(int(max(engine_power_to_rpm.keys(), key=int)), 1)
-            P_sea_kw = float(engine_power_to_rpm[str(rpm_top)])
-            Pav_kw = P_sea_kw * altitude_power_scale(density_ratio_sigma(altitude_m))
-            Pav_w  = Pav_kw * 1000.0 * eta_p * eta_gbx
-            T_est  = Pav_w / max(V_ms, 1.0)
-            Cm_thrust = - T_est * (thrustline_z_m - z_cg_m) / (Q * wing_planform_area_m2 * mean_aerodynamic_chord_m)
-
-            nondim_arm_w = (x_ac_wing_m - xcg_m) / mean_aerodynamic_chord_m
-            tail_q_ratio = calculate_eta_h(cur, phase="cruiseout") if "calculate_eta_h" in globals() else 1.0
-            denom = tail_q_ratio * (horizontal_tail_area_m2/wing_planform_area_m2) * (tail_arm_m/mean_aerodynamic_chord_m)
-            CL_tail = - (Cm_wing + CL_wing*nondim_arm_w + Cm_thrust) / max(denom, 1e-9)
-
-            # Correct wing CL by subtracting tail lift
-            tail_lift_N = tail_q_ratio * Q * horizontal_tail_area_m2 * CL_tail
-            CL_wing_new = (weight_N - tail_lift_N) / (Q * wing_planform_area_m2)
-            CL_wing = 0.65*CL_wing + 0.35*CL_wing_new
-
-        # Drag (wing + tail)
-        CD_wing = CD0_phase + induced_k_wing * (CL_wing**2)
-        if include_tail_drag:
-            CD_tail = CD0_phase + induced_k_tail * (CL_tail**2)
-        else:
-            CD_tail = 0.0
-
-        total_drag_N = Q * (wing_planform_area_m2 * CD_wing + horizontal_tail_area_m2 * CD_tail)
-        power_required_W = total_drag_N * V_ms
-
-        return power_required_W
-
-    # Altitude march (best-rate at each slice)
-    H_target = float(target_altitude_m if target_altitude_m is not None else hard_constraints.get("cruise_altitude_m", 3000.0))
-    if H_target <= start_altitude_m:
-        return {"time_to_altitude_s": 0.0, "profile": []}
-
-    ΔH = (H_target - start_altitude_m) / altitude_slices
-    total_time_s = 0.0
-    profile = []
-    roc_curves = {}
-
-    for i in range(altitude_slices):
-        H_mid = start_altitude_m + (i + 0.5) * ΔH
-        rho = get_air_density(H_mid)
-        sigma = rho / get_air_density(0.0)
-
-        # Speed sweep (bounds from stall guess to cruise)
-        # Use CL_max of phase to estimate Vs
-        CLmax_phase = float(deflections_dict[f"{climb_phase_prefix}_0"]["CL"].max())
-        Vs = (2.0 * weight_N / (rho * wing_planform_area_m2 * CLmax_phase)) ** 0.5
-        V_lo = max(1.05*Vs, 0.6*Vs)
-        V_hi = max(kmh_to_ms(cur.get("cruiseout_speed_kmh", 150.0)), 1.6*Vs)
-
-        best_ROC = -1.0
-        best_V = None
-        curve_V, curve_ROC = [], []
-
-        for frac in np.linspace(0.0, 1.0, 60):
-            V = V_lo + frac * (V_hi - V_lo)
-            power_req_W = trimmed_drag_and_power_required(V, H_mid)
-
-            # Choose RPM & compute available power to the AIR + SFC (from your maps)
-            # For "max_rate", we run near the top end of the rpm map
-            if operate_mode == "max_rate":
-                rpm_cmd = float(max(int(max(engine_power_to_rpm.keys(), key=int)), 1))
-                P_sea_kw = P_of_rpm(rpm_cmd)
-                P_shaft_kw = P_sea_kw * altitude_power_scale(sigma)
-                eta_p = prop_efficiency_vs_speed(V)
-                power_avail_W = eta_p * eta_gbx * P_shaft_kw * 1000.0
-
-            else:  # "min_sfc_at_required": deliver at least required power with lowest SFC
-                eta_p = prop_efficiency_vs_speed(V)
-                P_req_shaft_kw = power_req_W / max(eta_p * eta_gbx, 1e-6) / 1000.0
-                rpm_guess = rpm_for_power(P_req_shaft_kw)
-                rpm_cmd = float(np.clip(rpm_guess, min(P_of_rpm.__defaults__[0]), max(P_of_rpm.__defaults__[0])))
-                # simple correction for altitude scale:
-                # search a small neighborhood for feasibility and min SFC
-                candidates = np.clip(np.array([rpm_cmd-200, rpm_cmd, rpm_cmd+200, rpm_cmd+400]),
-                                     min(engine_power_to_rpm, key=int),
-                                     max(engine_power_to_rpm, key=int)).astype(float)
-                best = None
-                for r in np.unique(candidates):
-                    P_sea_kw = P_of_rpm(r)
-                    P_shaft_kw = P_sea_kw * altitude_power_scale(sigma)
-                    if P_shaft_kw < P_req_shaft_kw: 
-                        continue
-                    sfc = SFC_of_rpm(r)
-                    if best is None or sfc < best["sfc"]:
-                        best = {"rpm": r, "P_shaft_kw": P_shaft_kw, "sfc": sfc}
-                if best is None:
-                    # not enough power—fall back to max rpm (ROC likely small)
-                    r = float(max(int(max(engine_power_to_rpm.keys(), key=int)), 1))
-                    P_shaft_kw = P_of_rpm(r) * altitude_power_scale(sigma)
-                    rpm_cmd = r
-                else:
-                    P_shaft_kw = best["P_shaft_kw"]; rpm_cmd = best["rpm"]
-                power_avail_W = eta_p * eta_gbx * P_shaft_kw * 1000.0
-
-            ROC = max(0.0, (power_avail_W - power_req_W) / weight_N)
-            curve_V.append(V); curve_ROC.append(ROC)
-            if ROC > best_ROC:
-                best_ROC = ROC; best_V = V
-
-        if best_ROC <= 1e-6:
-            return {"time_to_altitude_s": float("inf"),
-                    "failed_at_m": H_mid, "profile": profile, "roc_curves": roc_curves}
-
-        dt = ΔH / best_ROC
-        total_time_s += dt
-        profile.append({"alt_m": H_mid, "Vy_ms": best_V, "ROC_ms": best_ROC})
-        roc_curves[H_mid] = {"V_ms": curve_V, "ROC_ms": curve_ROC}
-
-    return {"time_to_altitude_s": total_time_s, "profile": profile, "roc_curves": roc_curves}
-
-def size_wing_area_for_takeoff_with_flaps(
-    cur, assumed_and_set, hard_constraints, deflections_dict,
-    flap_deflection_deg=20, flap_span_fraction=0.50,
-    spanwise_flap_effectiveness=0.95,
-    rotation_factor_Vlof_over_Vstall=1.20,   # V_LOF = 1.2 * V_stall_TO
-    ground_CL_fraction_of_CLmax=0.90,        # average CL during roll
-    oswald_e_takeoff=0.80,
-    max_bisection_iter=30, area_tol=0.5
-):
-    """
-    Returns a dict with:
-      - wing_area_required_m2 (max of stall and distance constraints)
-      - wing_area_from_stall_m2
-      - wing_area_from_groundrun_m2
-      - takeoff_ground_run_m
-      - V_stall_TO_ms, V_LOF_ms
-      - details (CD0_TO, CLmax_TO_eff, etc.)
-    """
-    import math
-    g = 9.81
-    sea_level_density = get_air_density(0.0)
-    rolling_mu = float(assumed_and_set.get("rolling_resistance_coefficient", 0.04))
-    required_ground_run_m = float(hard_constraints.get("takeoff_distance_max_m", 50.0))
-
-    # Mass/weight at takeoff
-    takeoff_mass_kg = cur.get("takeoff_mass_kg", cur.get("mtow"))
-    weight_N = takeoff_mass_kg * g
-
-    # Aspect ratio and induced drag factor
-    AR_wing = float(assumed_and_set.get("aspect_ratio", 12.0))
-    k_induced = 1.0 / (math.pi * AR_wing * oswald_e_takeoff)
-
-    # Effective CLmax for partial-span flaps (use *max* CL at the airfoil level, then blend)
-
-    λ_eff = max(0.0, min(1.0, spanwise_flap_effectiveness * flap_span_fraction))
-    clmax_pack = effective_CLmax_partial_span(
-        deflections_dict,
-        phase_prefix="takeoff",
-        flap_deflection_deg=flap_deflection_deg,
-        flap_span_fraction=flap_span_fraction,
-        spanwise_flap_effectiveness=spanwise_flap_effectiveness,
-        alpha_margin_deg=0.0  # or 0.5–1.0° if you want a conservative buffer
-    )
-    CLmax_TO_eff = clmax_pack["CLmax_eff"]
-    alpha_at_CLmax_deg = clmax_pack["alpha_at_CLmax_deg"]
-
-    # CD0 in takeoff config at CL≈0, blended
-    def CD0_effective():
-        def CD0_from(table_key):
-            return float(get_row_for_cl(deflections_dict[table_key], 0.0)["CD"])
-        CD0_clean = CD0_from("takeoff_0") if "takeoff_0" in deflections_dict else CD0_from("cruise_0")
-        CD0_flap  = CD0_from(flap_key) if flap_key in deflections_dict else CD0_clean
-        return (1.0 - λ_eff)*CD0_clean + λ_eff*CD0_flap
-    CD0_TO = CD0_effective()
-
-    # Stall-constraint area using YOUR stall speed requirement
-    Vstall_target_ms = kmh_to_ms(float(hard_constraints.get("stall_speed_kmh", 55.0)))
-    wing_area_from_stall_m2 = 2.0 * weight_N / (sea_level_density * Vstall_target_ms**2 * CLmax_TO_eff)
-
-    # Ground-roll integrator with bisection on wing area
-    def compute_ground_run_for_area(wing_planform_area_m2):
-        V_stall_ms = math.sqrt(2.0 * weight_N / (sea_level_density * wing_planform_area_m2 * CLmax_TO_eff))
-        V_liftoff_ms = rotation_factor_Vlof_over_Vstall * V_stall_ms
-        dv = max(0.2, V_liftoff_ms / 400.0)
-        distance_m = 0.0
-        v = 0.1
-
-        # Choose an average CL during roll; get α that matches the target CL on the effective polar
-        CL_ground_avg = ground_CL_fraction_of_CLmax * CLmax_TO_eff
-        alpha_ground_deg = solve_wing_alpha_for_target_CL_effective(
-            deflections_dict, "takeoff", CL_ground_avg,
-            flap_deflection_deg, flap_span_fraction, spanwise_flap_effectiveness
-        )
-
-        # Use **blended** CD at that alpha for parasitic part; add induced drag from CL_ground_avg
-        coeffs = effective_wing_coefficients_at_alpha(
-            deflections_dict, "takeoff", alpha_ground_deg,
-            flap_deflection_deg, flap_span_fraction, spanwise_flap_effectiveness
-        )
-        CD_parasitic = coeffs["CD"]  # this already includes flap-induced profile increase at that α
-
-        # Basic thrust model: P_air = η_p(V)*η_gb*P_shaft(RPM(V)); approximate η_p by your blend
-        eta_takeoff = propeller_specs["efficiency"].get("takeoff", propeller_specs["efficiency"].get("take-off", 0.75))
-        eta_gbx = float(engine_specs.get("gear_box_efficiency", 1.0))
-        Pmax_kw = float(engine_specs.get("max_power_kw", engine_specs.get("max_cruise_power_kw", 0.0)))
-        Pavail_air_W = eta_takeoff * eta_gbx * Pmax_kw * 1000.0  # nearly flat vs v at constant-power, low speed
-        T_static_cap = float(engine_specs.get("static_thrust_N", 1e9))
-
-        while v < V_liftoff_ms:
-            Q = 0.5 * sea_level_density * v*v
-            CD_total = CD_parasitic + k_induced * (CL_ground_avg**2)
-            drag_N = Q * wing_planform_area_m2 * CD_total
-            lift_N = Q * wing_planform_area_m2 * CL_ground_avg
-            normal_N = max(0.0, weight_N - lift_N)
-
-            # Thrust available ~ min(static cap, Pavail/V)
-            T_avail = min(T_static_cap, Pavail_air_W / max(1.0, v))
-            accel = (T_avail - drag_N - rolling_mu * normal_N) / takeoff_mass_kg
-            if accel <= 1e-4:
-                return float("inf"), V_stall_ms, V_liftoff_ms
-
-            distance_m += (v / accel) * dv
-            v += dv
-
-        return distance_m, V_stall_ms, V_liftoff_ms
-
-    # Bisection on area to meet ground-run limit
-    area_lo = max(0.5 * wing_area_from_stall_m2, 0.1)
-    area_hi = 4.0 * wing_area_from_stall_m2
-    dist_hi, _, _ = compute_ground_run_for_area(area_hi)
+    flo, fhi = f(lo), f(hi)
     guard = 0
-    while dist_hi == float("inf") and guard < 6:
-        area_hi *= 1.5
-        dist_hi, _, _ = compute_ground_run_for_area(area_hi)
+    while flo * fhi > 0.0 and guard < 6:
+        lo -= 2.0; hi += 2.0
+        flo, fhi = f(lo), f(hi)
+        guard += 1
+    if flo * fhi > 0.0:
+        row0 = get_row_for_cl(deflections_dict[base_key], 0.0)
+        return {"CD0_eff": float(row0["CD"]), "alpha_at_CL0_deg": float(row0["alpha"]), "lambda_eff": lam}
+
+    for _ in range(max_iter):
+        mid = 0.5*(lo+hi)
+        fm = f(mid)
+        if abs(fm) < tol:
+            cd0 = float(coeffs_at_alpha(mid)["CD"])
+            return {"CD0_eff": cd0, "alpha_at_CL0_deg": mid, "lambda_eff": lam}
+        if fm * flo <= 0.0:
+            hi, fhi = mid, fm
+        else:
+            lo, flo = mid, fm
+
+    alpha0 = 0.5*(lo+hi)
+    cd0 = float(coeffs_at_alpha(alpha0)["CD"])
+    return {"CD0_eff": cd0, "alpha_at_CL0_deg": alpha0, "lambda_eff": lam}
+
+def wing_area_from_stall_speed(
+    cur, hard_constraints, deflections_dict, assumed_and_set,
+    alpha_margin_deg=0.0, altitude_m=0.0
+):
+    """
+    Sizing by Vs target with partial-span flaps.
+    Uses your effective_CLmax_partial_span (α-aware).
+    """
+
+    rho = get_air_density(altitude_m)
+    g = 9.81
+    W = cur["mtow"] * g
+    Vs_ms = kmh_to_ms(hard_constraints["stall_speed_kmh"])
+
+    pack = effective_CLmax_partial_span(
+        deflections_dict, assumed_and_set, phase_prefix="takeoff",
+        alpha_margin_deg=alpha_margin_deg
+    )
+    CLmax_eff = pack["CLmax_eff"]
+
+    Sw = W / (0.5 * rho * Vs_ms**2 * CLmax_eff)
+    return {"wing_area_m2": Sw, "CLmax_eff": CLmax_eff, "alpha_at_CLmax_deg": pack["alpha_at_CLmax_deg"]}
+
+
+def wing_area_from_takeoff_distance(
+    cur, assumed_and_set, hard_constraints,
+    engine_specs, propeller_specs, deflections_dict,
+    thrust_static_cap_factor=1.1,   # caps T ~ factor * (Pavail / V_LOF)
+    altitude_m=0.0,
+    max_iter=40, tol=0.5
+):
+    """
+    Solve for wing area S so that computed ground roll ≤ hard_constraints['takeoff_distance_max_m'].
+
+    Model:
+      m * dV/dt = T(V) - D(V,S) - μ (W - L(V,S))
+      dx/dt = V
+      stop when V ≥ 1.2 * Vs_flap (LOF criterion)
+    """
+
+    cl_fraction_of_max = assumed_and_set["takeoff_cl_fraction_from_max"]
+    oswald_e_TO = assumed_and_set["oswald_derated"]
+
+    g = 9.81
+    rho = get_air_density(altitude_m)
+    W = cur["mtow"] * g
+    m = W / g
+    ARw = float(assumed_and_set.get("aspect_ratio", 12.0))
+    mu_roll = float(assumed_and_set["rolling_resistance_coefficient"])
+
+    # Flap-effective CLmax and CD0
+    cl_pack = effective_CLmax_partial_span(
+        deflections_dict, assumed_and_set, "takeoff", 0.0
+    )
+    cd0_pack = effective_CD0_partial_span(
+        deflections_dict, assumed_and_set, "takeoff"
+    )
+
+    CLmax_eff = cl_pack["CLmax_eff"]
+    CD0_eff = cd0_pack["CD0_eff"]
+
+    # Induced factor
+    k_ind = 1.0 / (math.pi * ARw * oswald_e_TO)
+
+    # Power available (takeoff)
+    eta_prop_TO = propeller_specs["efficiency"].get("takeoff", propeller_specs["efficiency"].get("take-off", 0.75))
+    eta_gb = float(engine_specs.get("gear_box_efficiency", 1.0))
+    P_avail_W = float(engine_specs["max_power_kw"]) * 1000.0 * eta_prop_TO * eta_gb
+
+    s_target = float(hard_constraints["takeoff_distance_max_m"])
+
+    def ground_roll_for_S(Sw):
+        # determine Vs with flaps for this S
+        Vs = math.sqrt(W / (0.5 * rho * Sw * CLmax_eff))
+        V_LOF = 1.2 * Vs
+
+        # cap thrust near static using V_LOF
+        T_cap = thrust_static_cap_factor * (P_avail_W / max(V_LOF, 1.0))
+
+        # average CL during roll
+        CL_avg = cl_fraction_of_max * CLmax_eff
+
+        # integrate with fixed dt in speed domain (simple, robust)
+        V = 0.1  # m/s to avoid div by zero
+        x = 0.0
+        dt = 0.05
+        while V < V_LOF and x < 5 * s_target:
+            q = 0.5 * rho * V**2
+            L = q * Sw * CL_avg
+            CD = CD0_eff + k_ind * (CL_avg**2)
+            D = q * Sw * CD
+            T = min(P_avail_W / max(V, 1.0), T_cap)
+            a = (T - D - mu_roll * (W - L)) / m
+            a = max(a, 0.0)
+            V += a * dt
+            x += V * dt
+        return x, V_LOF
+
+    # Solve for S by simple bracket + secant on f(S)=x(S)-s_target
+    # Bracket
+    S_lo = max(0.5, W / (0.5 * rho * kmh_to_ms(hard_constraints["stall_speed_kmh"])**2 * CLmax_eff)) * 0.5
+    S_hi = S_lo * 4.0
+    x_lo, _ = ground_roll_for_S(S_lo)
+    x_hi, _ = ground_roll_for_S(S_hi)
+
+    guard = 0
+    while (x_lo > s_target) and guard < 12:
+        S_lo *= 1.2
+        x_lo, _ = ground_roll_for_S(S_lo)
+        guard += 1
+    guard = 0
+    while (x_hi < s_target) and guard < 12:
+        S_hi *= 1.5
+        x_hi, _ = ground_roll_for_S(S_hi)
         guard += 1
 
-    wing_area_from_groundrun_m2 = area_hi
-    for _ in range(max_bisection_iter):
-        area_mid = 0.5 * (area_lo + area_hi)
-        s_mid, _, _ = compute_ground_run_for_area(area_mid)
-        if s_mid <= required_ground_run_m:
-            wing_area_from_groundrun_m2 = area_mid
-            area_hi = area_mid
-        else:
-            area_lo = area_mid
-        if abs(area_hi - area_lo) < area_tol:
-            break
+    S0, S1 = S_lo, S_hi
+    x0, x1 = x_lo, x_hi
 
-    wing_area_required_m2 = max(wing_area_from_stall_m2, wing_area_from_groundrun_m2)
-    s_final, Vstall_TO_ms, Vlof_ms = compute_ground_run_for_area(wing_area_required_m2)
+    for _ in range(max_iter):
+        if abs(x1 - x0) < 1e-6:
+            S_try = 0.5*(S0 + S1)
+        else:
+            # secant
+            S_try = S1 + (s_target - x1) * (S1 - S0) / (x1 - x0)
+
+        S_try = max(S_lo*0.5, min(S_hi*2.0, S_try))
+        x_try, V_LOF = ground_roll_for_S(S_try)
+        if abs(x_try - s_target) < tol:
+            return {
+                "wing_area_m2": float(S_try),
+                "ground_roll_m": float(x_try),
+                "V_LOF_ms": float(V_LOF),
+                "CLmax_eff": CLmax_eff,
+                "CD0_eff": CD0_eff
+            }
+        S0, x0 = S1, x1
+        S1, x1 = S_try, x_try
 
     return {
-        "wing_area_required_m2": wing_area_required_m2,
-        "wing_area_from_stall_m2": wing_area_from_stall_m2,
-        "wing_area_from_groundrun_m2": wing_area_from_groundrun_m2,
-        "takeoff_ground_run_m": s_final,
-        "V_stall_TO_ms": Vstall_TO_ms,
-        "V_LOF_ms": Vlof_ms,
-        "details": {
-            "CLmax_TO_eff": CLmax_TO_eff,
-            "CD0_TO_est": CD0_TO,
-            "flap_span_fraction": flap_span_fraction,
-            "flap_deflection_deg": flap_deflection_deg,
-            "spanwise_flap_effectiveness": spanwise_flap_effectiveness
-        }
+        "wing_area_m2": float(S1),
+        "ground_roll_m": float(x1),
+        "V_LOF_ms": float(V_LOF),
+        "CLmax_eff": CLmax_eff,
+        "CD0_eff": CD0_eff
     }
