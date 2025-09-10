@@ -161,13 +161,18 @@ def _estimate_component_positions(fuselage_length, wing_le_position, chord, tail
         "misc": cg_estimate
     }
 
-def estimate_component_positions(current_values, hard_constraints, assumed_and_set, weights_dict_kg_no_fuel):
+def estimate_component_positions(current_values, hard_constraints, assumed_and_set, weights_dict_kg_no_fuel, internal_payload_x = None):
 
     cg_estimate = current_values[f"cruiseout_cg_from_nose_m"]
 
     tail_local_cg_ht_z = weights_dict_kg_no_fuel["horizontal_tail"] * (current_values["h_tail_chord_m"] * assumed_and_set["wing_airfoil_thickness_ratio"]) / 2
     tail_local_cg_vt_z = weights_dict_kg_no_fuel["vertical_tail"] * current_values["v_tail_span_m"] / 2
     tail_local_cg_z = (tail_local_cg_ht_z + tail_local_cg_vt_z) / weights_dict_kg_no_fuel["tails"]
+
+    if internal_payload_x is not None:
+        internal_payload_x_position = internal_payload_x
+    else:
+        internal_payload_x_position = (0.5*hard_constraints["internal_payload_length"]) + 1.5
 
     wing_vertical_position = current_values['high_wing_offset_m'] + (current_values['fuselage_body_height_m']/2)
     full_dict = {
@@ -184,7 +189,7 @@ def estimate_component_positions(current_values, hard_constraints, assumed_and_s
                       0.5*current_values["fuselage_body_height_m"] ),
 
         # "internal_payload": (current_values["fuselage_body_length_m"] - 1 - (0.5*hard_constraints["internal_payload_length"]), 
-        "internal_payload": ((0.5*hard_constraints["internal_payload_length"]) + 1.5, 
+        "internal_payload": (internal_payload_x_position, 
                              0.35*current_values["fuselage_body_height_m"]),
         "wing_payload": (current_values["wing_le_position_m"] + 0.5 * current_values["chord_m"], 
                          -0.2*current_values["fuselage_body_height_m"]),
@@ -1406,3 +1411,135 @@ def wing_area_from_takeoff_distance(
         "CLmax_eff": CLmax_eff,
         "CD0_eff": CD0_eff
     }
+
+def climb_rate_ms(
+    cur, assumed_and_set, engine_specs, propeller_specs, deflections_dict,
+    wing_area_m2,
+    altitude_m, speed_kmh,
+    config="clean",  # "takeoff" or "clean"
+    flap_deflection_deg=0, flap_span_fraction=0.50, spanwise_flap_effectiveness=0.95,
+    oswald_e=0.85
+):
+    """
+    ROC at (altitude, speed). Uses partial-span CD0 (config-dependent).
+    """
+    import math
+    rho = get_air_density(altitude_m)
+    V = kmh_to_ms(speed_kmh)
+    g = 9.81
+    W = cur.get("climb_mass_kg", cur.get("takeoff_mass_kg", cur["mtow"])) * g
+    ARw = float(assumed_and_set.get("aspect_ratio", 12.0))
+    k_ind = 1.0 / (math.pi * ARw * oswald_e)
+
+    # CD0
+    if config == "takeoff" and flap_deflection_deg != 0:
+        cd0_pack = effective_CD0_partial_span(
+            deflections_dict, phase_prefix="takeoff",
+            flap_deflection_deg=flap_deflection_deg,
+            flap_span_fraction=flap_span_fraction,
+            spanwise_flap_effectiveness=spanwise_flap_effectiveness
+        )
+        CD0 = cd0_pack["CD0_eff"]
+    else:
+        # clean CD0 at CL=0 from clean polar
+        row0 = get_row_for_cl(deflections_dict.get("cruise_0", deflections_dict["takeoff_0"]), 0.0)
+        CD0 = float(row0["CD"])
+
+    q = 0.5 * rho * V**2
+    CL = W / (q * wing_area_m2)
+    CD = CD0 + k_ind * CL**2
+    D = q * wing_area_m2 * CD
+
+    # Power available at this condition (simple cap by engine max power and prop η)
+    eta_gb = float(engine_specs.get("gear_box_efficiency", 1.0))
+    # You can curve-fit η_prop(V,alt). Here: use "climb" if present, else "cruise".
+    eta_prop = propeller_specs["efficiency"].get("climb",
+                  propeller_specs["efficiency"].get("cruise", 0.80))
+    P_max_W = float(engine_specs.get("max_power_kw", engine_specs.get("max_cruise_power_kw", 0.0))) * 1000.0
+    P_av = eta_prop * eta_gb * P_max_W
+
+    P_req = D * V
+    ROC = max(0.0, (P_av - P_req) / W)
+    return ROC
+
+def time_to_altitude(
+    cur, assumed_and_set, engine_specs, propeller_specs, deflections_dict,
+    wing_area_m2,
+    alt_start_m, alt_end_m,
+    speed_mode="best",   # "best" or "given"
+    speed_kmh_given=None,
+    config="clean",
+    flap_deflection_deg=0, flap_span_fraction=0.50, spanwise_flap_effectiveness=0.95,
+    oswald_e=0.85,
+    steps=40
+):
+    """
+    Integrate dt = dh / ROC(h). If speed_mode="best", maximize ROC over a speed grid
+    per layer. Returns hours and an ROC profile list.
+    """
+    import numpy as np
+
+    h_grid = np.linspace(alt_start_m, alt_end_m, steps+1)
+    total_time_s = 0.0
+    roc_profile = []
+
+    for i in range(steps):
+        h_lo, h_hi = float(h_grid[i]), float(h_grid[i+1])
+        h_mid = 0.5*(h_lo + h_hi)
+        dh = h_hi - h_lo
+
+        if speed_mode == "best":
+            # grid around 1.3 Vs (clean or flap)
+            rho_mid = get_air_density(h_mid)
+            g = 9.81
+            W = cur.get("climb_mass_kg", cur.get("takeoff_mass_kg", cur["mtow"])) * g
+
+            if config == "takeoff" and flap_deflection_deg != 0:
+                cl_pack = effective_CLmax_partial_span(
+                    deflections_dict, phase_prefix="takeoff",
+                    flap_deflection_deg=flap_deflection_deg,
+                    flap_span_fraction=flap_span_fraction,
+                    spanwise_flap_effectiveness=spanwise_flap_effectiveness
+                )
+                CLmax_eff = cl_pack["CLmax_eff"]
+            else:
+                # clean CLmax from clean table for Vs estimate
+                CLmax_eff = float(deflections_dict.get("cruise_0", deflections_dict["takeoff_0"])["CL"].max())
+
+            Vs_mid = np.sqrt(W / (0.5 * rho_mid * wing_area_m2 * CLmax_eff))
+            speeds = np.linspace(1.15*Vs_mid, 1.6*Vs_mid, 9)  # m/s
+            best_roc = 0.0
+            best_kmh = None
+            for V in speeds:
+                roc = climb_rate_ms(
+                    cur, assumed_and_set, engine_specs, propeller_specs, deflections_dict,
+                    wing_area_m2, h_mid, V*3.6,
+                    config=config, flap_deflection_deg=flap_deflection_deg,
+                    flap_span_fraction=flap_span_fraction,
+                    spanwise_flap_effectiveness=spanwise_flap_effectiveness,
+                    oswald_e=oswald_e
+                )
+                if roc > best_roc:
+                    best_roc = roc; best_kmh = V*3.6
+            ROC_mid = best_roc
+            V_used_kmh = best_kmh
+        else:
+            if speed_kmh_given is None:
+                raise ValueError("Provide speed_kmh_given when speed_mode='given'.")
+            ROC_mid = climb_rate_ms(
+                cur, assumed_and_set, engine_specs, propeller_specs, deflections_dict,
+                wing_area_m2, h_mid, speed_kmh_given,
+                config=config, flap_deflection_deg=flap_deflection_deg,
+                flap_span_fraction=flap_span_fraction,
+                spanwise_flap_effectiveness=spanwise_flap_effectiveness,
+                oswald_e=oswald_e
+            )
+            V_used_kmh = speed_kmh_given
+
+        ROC_mid = max(ROC_mid, 1e-3)  # avoid divide by zero
+        dt = dh / ROC_mid  # seconds
+        total_time_s += dt
+        roc_profile.append({"h_mid_m": h_mid, "ROC_ms": ROC_mid, "V_used_kmh": V_used_kmh})
+
+    return {"time_mins": total_time_s/60.0, "profile": roc_profile}
+
