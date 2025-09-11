@@ -1279,13 +1279,14 @@ def wing_area_from_stall_speed(
     W = cur["mtow"] * g
     Vs_ms = kmh_to_ms(hard_constraints["stall_speed_kmh"])
 
+    V_LOF = 1.2 * Vs_ms
     pack = effective_CLmax_partial_span(
         deflections_dict, assumed_and_set, phase_prefix="takeoff",
         alpha_margin_deg=alpha_margin_deg
     )
     CLmax_eff = pack["CLmax_eff"]
 
-    Sw = W / (0.5 * rho * Vs_ms**2 * CLmax_eff)
+    Sw = W / (0.5 * rho * V_LOF**2 * CLmax_eff)
     return {"wing_area_m2": Sw, "CLmax_eff": CLmax_eff, "alpha_at_CLmax_deg": pack["alpha_at_CLmax_deg"]}
 
 
@@ -1434,10 +1435,7 @@ def climb_rate_ms(
     # CD0
     if config == "takeoff" and flap_deflection_deg != 0:
         cd0_pack = effective_CD0_partial_span(
-            deflections_dict, phase_prefix="takeoff",
-            flap_deflection_deg=flap_deflection_deg,
-            flap_span_fraction=flap_span_fraction,
-            spanwise_flap_effectiveness=spanwise_flap_effectiveness
+            deflections_dict, assumed_and_set, phase_prefix="takeoff",
         )
         CD0 = cd0_pack["CD0_eff"]
     else:
@@ -1496,10 +1494,7 @@ def time_to_altitude(
 
             if config == "takeoff" and flap_deflection_deg != 0:
                 cl_pack = effective_CLmax_partial_span(
-                    deflections_dict, phase_prefix="takeoff",
-                    flap_deflection_deg=flap_deflection_deg,
-                    flap_span_fraction=flap_span_fraction,
-                    spanwise_flap_effectiveness=spanwise_flap_effectiveness
+                    deflections_dict, assumed_and_set, phase_prefix="takeoff",
                 )
                 CLmax_eff = cl_pack["CLmax_eff"]
             else:
@@ -1541,5 +1536,39 @@ def time_to_altitude(
         total_time_s += dt
         roc_profile.append({"h_mid_m": h_mid, "ROC_ms": ROC_mid, "V_used_kmh": V_used_kmh})
 
-    return {"time_mins": total_time_s/60.0, "profile": roc_profile}
+    return {"time_mins": total_time_s/60.0,"profile": roc_profile}
 
+def update_time_to_altitude_and_ROC(predrop, assumed_and_set, hard_constraints, engine_specs, propeller_specs, deflections_dict):
+
+    time_to_alt_before_retraction = time_to_altitude(
+                predrop, assumed_and_set, engine_specs, propeller_specs, deflections_dict,
+                wing_area_m2 = predrop["wing_area_m2"],
+                alt_start_m = 0, alt_end_m = 200,
+                speed_mode="best",   # "best" or "given"
+                speed_kmh_given=None,
+                config="takeoff",
+                flap_deflection_deg=20, flap_span_fraction=0.50, spanwise_flap_effectiveness=0.95,
+                oswald_e=assumed_and_set['oswald_derated'],
+                steps=16
+            )
+
+    time_to_alt_after_retraction = time_to_altitude(
+                predrop, assumed_and_set, engine_specs, propeller_specs, deflections_dict,
+                wing_area_m2 = predrop["wing_area_m2"],
+                alt_start_m = 200, alt_end_m = hard_constraints["cruise_altitude_m"],
+                speed_mode="best",   # "best" or "given"
+                speed_kmh_given=None,
+                config="clean",
+                flap_deflection_deg=0, flap_span_fraction=0.50, spanwise_flap_effectiveness=0.95,
+                oswald_e=assumed_and_set['oswald_clean'],
+                steps=16
+            )
+
+    time_to_alt_total = time_to_alt_before_retraction['time_mins'] + time_to_alt_after_retraction['time_mins'] 
+    predrop['climb_time_to_altitude_min'] = time_to_alt_total
+
+    climb_profile = time_to_alt_before_retraction['profile'] + time_to_alt_before_retraction['profile']
+    average_roc = sum([step["ROC_ms"] for step in climb_profile]) / len(climb_profile)
+    predrop['average_climb_rate_mps'] = average_roc
+
+    return predrop
