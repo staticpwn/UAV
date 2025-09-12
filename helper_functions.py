@@ -5,36 +5,14 @@ from ADRpy import atmospheres as at
 import ussa1976
 from specs import *
 
+# Constants
+g = 9.81  # m/s²
+atm = at.Atmosphere()
+
 # functions
 
 def kmh_to_ms(v_kmh):
     return v_kmh / 3.6
-
-def ms_to_kmh(v_ms):
-    return v_ms * 3.6
-
-def calc_required_wing_area(mtow_kg, cl_max, rho, v_stall_kmh):
-
-    v_stall_ms = kmh_to_ms(v_stall_kmh)
-    weight_n = mtow_kg * 9.81
-    s = (2 * weight_n) / (rho * v_stall_ms**2 * cl_max)
-    return s
-
-def calc_stall_speed(mtow_kg, wing_area, cl_max, rho):
-    weight_n = mtow_kg * 9.81
-    v_stall = math.sqrt((2 * weight_n) / (rho * wing_area * cl_max))
-    return v_stall
-
-def calc_takeoff_distance(v_to_ms, acceleration):
-    return v_to_ms**2 / (2 * acceleration)
-
-def calc_acceleration(thrust_n, mass_kg, mu, weight_n):
-    friction = mu * weight_n
-    net_force = thrust_n - friction
-    return net_force / mass_kg
-
-def calc_fuel_needed(power_kw, sfc, hours):
-    return power_kw * sfc * hours
 
 def estimate_cruise_sfc_from_dicts(power_vs_rpm_dict, sfc_vs_rpm_dict, cruise_power):
     # Convert keys and values to sorted numeric arrays
@@ -57,14 +35,6 @@ def estimate_cruise_sfc_from_dicts(power_vs_rpm_dict, sfc_vs_rpm_dict, cruise_po
         "sfc_cruise": sfc_cruise
     }
 
-
-# Constants
-g = 9.81  # m/s²
-atm = at.Atmosphere()
-
-# Helper: convert km/h to m/s
-def kmh_to_ms(v_kmh):
-    return v_kmh / 3.6
 
 # --- 1. Get air density at cruise altitude ---
 def get_air_density(altitude_m):
@@ -98,35 +68,11 @@ def calculate_reynolds_number(velocity_kmh, chord_m, altitude_m=0):
 
     return Re
 
-
-# --- 2. Calculate Lift Coefficient required for steady cruise ---
-def calc_cl_cruise(mtow_kg, v_kmh, wing_area_m2, altitude_m):
-    rho = get_air_density(altitude_m)
-    v = kmh_to_ms(v_kmh)
-    cl = (mtow_kg * g) / (0.5 * rho * v**2 * wing_area_m2)
-    return cl
-
 # --- 3. Estimate Drag Coefficient using parabolic drag polar ---
 def calc_cd_total(cd0, cl, aspect_ratio, e):
     k = 1 / (np.pi * e * aspect_ratio)
     return cd0 + k * cl**2
 
-# --- 4. Compute Required Power for Cruise ---
-def calc_power_required(mtow_kg, v_kmh, wing_area_m2, cd0, aspect_ratio, altitude_m, prop_eff):
-    rho = get_air_density(altitude_m)
-    v = kmh_to_ms(v_kmh)
-    cl = calc_cl_cruise(mtow_kg, v_kmh, wing_area_m2, altitude_m)
-    cd = calc_cd_total(cd0, cl, aspect_ratio)
-    drag = 0.5 * rho * v**2 * wing_area_m2 * cd
-    power_required = drag * v / prop_eff  # in watts
-    return power_required / 1000  # in kW
-
-# --- 5. Compute Cruise Fuel Burn ---
-def calc_cruise_fuel(mtow_kg, v_kmh, wing_area_m2, cd0, aspect_ratio, altitude_m, prop_eff, cruise_time_hr, cruise_power_kw):
-    sfc_data = estimate_cruise_sfc_from_dicts(engine_power_to_rpm, engine_sfc_to_rpm, cruise_power_kw)
-    sfc_kgperkwh = sfc_data["sfc_cruise"]
-    fuel_burn = cruise_power_kw * cruise_time_hr * sfc_kgperkwh
-    return fuel_burn, sfc_data["rpm_cruise"], sfc_kgperkwh
 
 def calculate_cg(weights_dict_input, positions_dict):
 
@@ -139,27 +85,6 @@ def calculate_cg(weights_dict_input, positions_dict):
     denominator = sum(weights_dict.values())
     return numerator / denominator
 
-def _estimate_component_positions(fuselage_length, wing_le_position, chord, tail_arm, internal_payload_length, fuselage_fuel_tank_length):
-    if cg_estimate is None:
-        cg_estimate = wing_le_position + 0.25 * chord  # Initial guess at 25% MAC
-
-    return {
-        "fuselage": 0.5 * fuselage_length,
-        "wing": wing_le_position + 0.45 * chord,
-        # "tails": tail_arm + wing_le_position + 0.25 * chord,
-        "tails": 0.9*fuselage_length,
-        "engine": fuselage_length * 0.95,
-        "propeller": fuselage_length * 1.0,
-        "internal_payload": fuselage_length - 1 - (0.5*internal_payload_length), # 1 is the fuselage length allotted for the engine and its accessories
-        "wing_payload": wing_le_position + 0.5 * chord,
-        # "payload": cg_estimate,
-        # "wing_fuel": wing_le_position + 0.5 * chord,
-        "wing_fuel": wing_le_position + 0.45 * chord,
-        "fuselage_fuel": wing_le_position - (0.5*fuselage_fuel_tank_length),
-        "avionics": fuselage_length * 0.1,
-        "landing_gear": cg_estimate - 0.1 * fuselage_length,
-        "misc": cg_estimate
-    }
 
 def estimate_component_positions(current_values, hard_constraints, assumed_and_set, weights_dict_kg_no_fuel, internal_payload_x = None):
 
@@ -258,41 +183,6 @@ def calculate_eta_h(current_values, phase='cruiseout'):
 
     # Only clamp to prevent non-physical values, not to force optimism
     return eta_h  # realistic lower bound
-
-
-def cross_section_area_fuselage_fuel_tank(fuselage_diameter, diameter_ratio_used_for_fuel_tank):
-    """
-    Calculate the area of a rectangle inscribed in a circle based on width ratio.
-
-    Args:
-        diameter (float): Diameter of the circle.
-        width_ratio (float): Ratio of rectangle width to circle diameter (e.g., 0.8 for 80%).
-
-    Returns:
-        float: Area of the rectangle.
-    """
-    if not (0 <= diameter_ratio_used_for_fuel_tank <= 1):
-        raise ValueError("width_ratio must be between 0 and 1.")
-
-    # Compute half-width of rectangle
-    half_width = (diameter_ratio_used_for_fuel_tank * fuselage_diameter) / 2
-
-    # Radius of the circle
-    R = fuselage_diameter / 2
-
-    # Vertical distance from center to rectangle side
-    y = math.sqrt(R**2 - half_width**2)
-
-    # Rectangle height is double this vertical distance
-    height = 2 * y
-
-    # Rectangle width
-    width = diameter_ratio_used_for_fuel_tank * fuselage_diameter
-
-    # Area
-    area = width * height
-
-    return area
 
 
 # Calculate Usable Fuel Tank Volume for Wing Using Selig S1223 Airfoil
@@ -889,70 +779,6 @@ def solve_delta_e_for_CLt(CLt_req, alpha_t_deg, deflections_dict, phase="cruise"
             lo, f_lo = mid, f_mid
     return 0.5*(lo + hi)
 
-def _closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints, deflections_dict, phase):
-    """
-    Computes wing CL, tail CL, wing/tail AoA and required elevator deflection
-    for a given flight phase using closed-form trim equations.
-    """
-    phase_for_delta = ""
-    # --- Normalise phase naming ---
-    if ("cruise" in phase) or (phase == "loiter"):
-        phase_for_delta = "cruise"
-    elif phase in ["takeoff", "landing"]:
-        phase_for_delta = "takeoff"
-
-    # --- Pull values from dicts ---
-    m = current_values["mtow"]  # or use a per-phase mass if stored separately
-    rho = get_air_density(hard_constraints["cruise_altitude_m"])
-    V_ms = kmh_to_ms(current_values[f"{phase}_speed_kmh"])
-    Sw = current_values["wing_area_m2"]
-    St = current_values["horizontal_tail_area_m2"]
-    cbar = current_values["chord_m"]
-    lt = current_values["tail_arm_m"]
-
-    # static margin (fraction of MAC)
-    SM = current_values[f"{phase}_static_margin"]
-
-    qt_over_q = current_values.get("tail_dynamic_pressure_ratio", 1.0)
-    downwash_grad = assumed_and_set.get("ht_downwash_efficiency_coeff", 0.3)
-    wing_inc = assumed_and_set["wing_incident_angle"]
-    ht_inc = assumed_and_set["ht_incident_angle"]
-
-    # --- Equilibrium equations ---
-    q = 0.5 * rho * V_ms**2
-    qt = qt_over_q * q
-    W = m * 9.81
-    CL_req = W / (q * Sw)
-
-    r = (qt / q) * (St / Sw)         # relative tail area*q
-    k = SM * (cbar / lt)
-
-    # Wing CL
-    CL_w = CL_req / (1.0 - k)
-
-    delta_cl_from_thrust = get_delt_cl_from_thrust(current_values, hard_constraints, phase)
-
-    # Tail CL (no thrust moment term here; add if you model it)
-    CL_t = - k * (1.0 / r) * CL_w + delta_cl_from_thrust
-
-    # --- Wing AoA from polar ---
-    alpha_w = get_row_for_cl(deflections_dict[f"{phase_for_delta}_0"], CL_w)["alpha"] - wing_inc
-
-    # --- Tail AoA seen by the tail (include downwash) ---
-    alpha_t = alpha_w * (1.0 - downwash_grad) + ht_inc
-
-    # --- Interpolate to find elevator deflection needed for CL_t ---
-
-    # delta_e = get_row_for_cl(df, CL_t)["alpha"]
-    delta_e = solve_delta_e_for_CLt(CL_t, alpha_t, deflections_dict, phase=phase_for_delta)
-
-    return {
-        "cl_wing": CL_w,
-        "cl_tail_required": CL_t,
-        "alpha_wing_deg": alpha_w,
-        "alpha_tail_deg": alpha_t,
-        "delta_elevator_deg": delta_e,
-    }
 
 def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints, deflections_dict, phase):
     """
@@ -985,7 +811,7 @@ def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints,
     i_w   = float(assumed_and_set.get("wing_incident_angle", 0.0))
     i_h   = float(assumed_and_set.get("ht_incident_angle",   0.0))
     deda  = float(assumed_and_set.get("ht_downwash_efficiency_coeff", 0.3))  # dε/dα
-    eta_h = current_values.get("tail_dynamic_pressure_ratio", 1.0)           # q_t / q
+    eta_h = current_values.get(f"{phase}_tail_dynamic_pressure_ratio", 1.0)           # q_t / q
 
     # --- First pass: wing-only CL to get the wing operating point ---
     CL_w = W / (q * Sw)   # initial guess (tail force not yet removed)
@@ -1012,18 +838,21 @@ def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints,
     Cm_fuse   = 0.0                 # add if you have it
     Cm_thrust = get_cm_thrust(current_values, hard_constraints, phase)                 # add if you model thrust pitching moment
 
+    # 
+
     CL_t = - (Cm_w + CL_w * d_w + Cm_fuse + Cm_thrust) / denom
 
+    # print(f"Cm_wing: {Cm_w:.4f}, Cm_fuse: {Cm_fuse:.4f}, Cm_thrust: {Cm_thrust:.4f}, CL_t: {CL_t:.4f}, denom: {denom: .4f}")
     # Optional: refine CL_w by removing the tail lift from force balance (one correction step)
     L_tail = (eta_h * q) * Sh * CL_t
     CL_w = (W - L_tail) / (q * Sw)
-#06-5188286
+
     # Re-read wing polar and Cm if you want a second, tighter pass:
     row_w   = get_row_for_cl(deflections_dict[f"{phase_for_delta}_0"], CL_w)
     alpha_w = float(row_w["alpha"]) - i_w
     Cm_w    = float(row_w["CM"])
     alpha_t = (1.0 - deda) * alpha_w + i_h
-    # (You could recompute CL_t again with the updated CL_w if desired.)
+    
 
     # --- Elevator deflection to achieve CL_t at alpha_t ---
     delta_e = solve_delta_e_for_CLt(CL_t, alpha_t, deflections_dict, phase=phase_for_delta)
@@ -1036,89 +865,6 @@ def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints,
         "delta_elevator_deg": delta_e,
     }
 
-
-def required_wing_area_consistent(cur, assumed_and_set, hard_constraints,
-                                  weights_dict_kg_no_fuel,
-                                  phase):
-    """
-    Return the required wing area [m^2] for the given phase, consistently:
-      - takeoff:  S = W_TO / (q_TO * CL_max)           (tail ignored at stall)
-      - cruise/loiter/back: S solves W = q*(Sw*CLw + q*eta_h*Sh*CLt),
-        using Sh/Sw from tail volume: Sh/Sw = Vh * c_bar / l_t
-
-    Expects in `cur` (from your iteration): 
-      speeds per phase, chord_m, tail_arm_m, 
-      cl per phase (wing), cl_tail_required per phase (tail), etc.
-    """
-
-    # --- helpers ---
-    def phase_weight_kg(phase):
-        # payload is zero on cruiseback, present otherwise
-        payload_internal = weights_dict_kg_no_fuel.get("internal_payload", 0.0) if phase != "cruiseback" else 0.0
-        payload_wing     = weights_dict_kg_no_fuel.get("wing_payload", 0.0)     if phase != "cruiseback" else 0.0
-
-        return (weights_dict_kg_no_fuel["fuselage"] +
-                weights_dict_kg_no_fuel["wing"] +
-                weights_dict_kg_no_fuel["tails"] +
-                weights_dict_kg_no_fuel["engine"] +
-                weights_dict_kg_no_fuel["propeller"] +
-                weights_dict_kg_no_fuel["avionics"] +
-                weights_dict_kg_no_fuel["landing_gear"] +
-                weights_dict_kg_no_fuel["misc"] +
-                cur.get("fuselage_fuel", 0.0) +
-                cur.get("wing_fuel", 0.0) +
-                payload_internal + payload_wing)
-
-    def q_dyn(alt_m, V_kmh):
-        rho = get_air_density(alt_m)
-        V   = kmh_to_ms(V_kmh)
-        return 0.5 * rho * V**2
-
-    # --- phase setup ---
-    if phase.lower() in ("takeoff", "stall"):
-        q = q_dyn(0.0, hard_constraints["stall_speed_kmh"])
-        W = phase_weight_kg("takeoff") * g
-        CLmax = hard_constraints["CL_max"]
-        if CLmax <= 0:
-            raise ValueError("CL_max must be > 0 for takeoff sizing.")
-        return W / (q * CLmax)
-
-    # cruise/loiter/cruiseback: include tail contribution via Vh
-    phase = phase.lower()
-    if phase not in ("cruiseout", "loiter", "cruiseback"):
-        raise ValueError(f"Unknown phase '{phase}'.")
-
-    # dynamic pressure at cruise altitude with phase speed
-    q = q_dyn(hard_constraints["cruise_altitude_m"], cur[f"{phase}_speed_kmh"])
-    W = phase_weight_kg(phase) * g
-
-    # wing & tail CLs from your converged state
-    CLw = cur.get(f"{phase}_cl", None)
-    CLt = cur.get(f"{phase}_cl_tail_required", 0.0)  # default 0 if missing
-    if CLw is None:
-        raise KeyError(f"{phase}_cl not found in `cur`.")
-
-    # geometry/volume terms
-    Vh   = assumed_and_set["horizontal_tail_volume_coefficient"]  # (l_t * S_h) / (S_w * c_bar)
-    lt   = cur["tail_arm_m"]
-    cbar = cur["chord_m"]
-    if lt <= 0 or cbar <= 0:
-        raise ValueError("tail_arm_m and chord_m must be > 0.")
-
-    # Sh/Sw from Vh and current geometry (no need to know Sw explicitly)
-    Sh_over_Sw = Vh * cbar / lt
-
-    # dynamic pressure ratio at tail
-    eta_h = calculate_eta_h(cur, phase=phase)
-
-    # denominator for Sw; guard against non-physical values
-    denom = (CLw + eta_h * Sh_over_Sw * CLt)
-    if denom <= 1e-9:
-        # If tail downforce is very large (or CLw tiny), you could hit denom≈0.
-        # In that edge case, ignore tail for sizing to avoid division blow-up.
-        denom = max(CLw, 1e-6)
-
-    return W / (q * denom)
 
 
 def effective_CLmax_partial_span(
