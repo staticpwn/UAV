@@ -779,8 +779,83 @@ def solve_delta_e_for_CLt(CLt_req, alpha_t_deg, deflections_dict, phase="cruise"
             lo, f_lo = mid, f_mid
     return 0.5*(lo + hi)
 
+def closed_form_trim_analysis(cur, assumed, hard, deflections_dict, phase):
+    """
+    Trim with real moment balance about CG (nose-up positive), using CG-based tail arm,
+    and a consistent 2x2 solve for CLw and CLt.
 
-def closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints, deflections_dict, phase):
+    Returns dict with: cl_wing, cl_tail_required, alpha_wing_deg, alpha_tail_deg, delta_elevator_deg
+    """
+    # Phase mapping & air density
+    if ("cruise" in phase) or (phase == "loiter"):
+        pk   = "cruise"
+        rho  = get_air_density(hard["cruise_altitude_m"])
+    elif phase in ["takeoff","landing"]:
+        pk   = "takeoff"
+        rho  = get_air_density(0.0)
+    else:
+        pk   = "cruise"
+        rho  = get_air_density(hard["cruise_altitude_m"])
+
+    g   = 9.81
+    m   = cur.get(f"{phase}_mass_kg", cur["mtow"])
+    V   = kmh_to_ms(cur[f"{phase}_speed_kmh"])
+    q   = 0.5*rho*V*V
+
+    Sw, Sh = cur["wing_area_m2"], cur["horizontal_tail_area_m2"]
+    c      = cur["chord_m"]
+    i_w    = float(assumed.get("wing_incident_angle", 0.0))
+    i_h    = float(assumed.get("ht_incident_angle",   0.0))
+    deda   = float(assumed.get("ht_downwash_efficiency_coeff", 0.3))
+    eta_h  = float(cur.get(f"{phase}_tail_dynamic_pressure_ratio", cur.get("tail_dynamic_pressure_ratio", 1.0)))
+
+    # Geometry about CG (all along x fuselage axis)
+    x_cg   = cur[f"{phase}_cg_from_nose_m"]
+    x_ac_w = cur["wing_le_position_m"] + 0.25*c
+    x_ac_t = cur["x_ht_le_m"] + 0.25*cur["h_tail_chord_m"]
+
+    d_w = (x_ac_w - x_cg)/c          # wing lever (non-dim)
+    L_t = (x_ac_t - x_cg)/c          # tail arm (non-dim, >0 if tail aft of CG)
+    if abs(L_t) < 1e-6:
+        raise ValueError("Tail arm about CG ~ 0; check geometry.")
+
+    # Required total CL from weight
+    CL_req = (m*g) / (q*Sw)
+
+    # First Cm_w from polar at a guess CL_w (use CL_req as initial guess)
+    row0  = get_row_for_cl(deflections_dict[f"{pk}_0"], CL_req)
+    Cm_w  = float(row0["CM"])
+    Cm_T  = get_cm_thrust(cur, hard, phase)  # must be normalized by q*Sw*c inside
+    
+    # Consistent 2x2 solve for CL_w and CL_t (closed form)
+    r = eta_h*(Sh/Sw)
+    CL_w = ( CL_req + (Cm_w + Cm_T)/L_t ) / ( 1.0 + d_w/L_t )
+    CL_t = -( Cm_w + Cm_T + CL_w*d_w ) / ( r*L_t )
+
+    # Optional one refresh of Cm_w using the solved CL_w
+    rowW = get_row_for_cl(deflections_dict[f"{pk}_0"], CL_w)
+    Cm_w = float(rowW["CM"])
+
+    # Re-solve once with refreshed Cm_w (usually tiny correction)
+    CL_w = ( CL_req + (Cm_w + Cm_T)/L_t ) / ( 1.0 + d_w/L_t )
+    CL_t = -( Cm_w + Cm_T + CL_w*d_w ) / ( r*L_t )
+
+    # Angles for reporting and delta_e
+    alpha_w = float(rowW["alpha"]) - i_w
+    alpha_t = (1.0 - deda)*alpha_w + i_h
+
+    delta_e = solve_delta_e_for_CLt(CL_t, alpha_t, deflections_dict, phase=pk)
+
+    return {
+        "cl_wing": CL_w,
+        "cl_tail_required": CL_t,
+        "alpha_wing_deg": alpha_w,
+        "alpha_tail_deg": alpha_t,
+        "delta_elevator_deg": delta_e,
+    }
+
+
+def _closed_form_trim_analysis(current_values, assumed_and_set, hard_constraints, deflections_dict, phase):
     """
     Computes wing CL, tail CL, wing/tail AoA and required elevator deflection
     for a given flight phase using real moment equilibrium (uses Cm_wing).
@@ -1036,6 +1111,183 @@ def wing_area_from_stall_speed(
     return {"wing_area_m2": Sw, "CLmax_eff": CLmax_eff, "alpha_at_CLmax_deg": pack["alpha_at_CLmax_deg"]}
 
 
+
+def _wing_area_from_takeoff_distance(
+    cur, assumed_and_set, hard_constraints,
+    engine_specs, propeller_specs, deflections_dict,
+    thrust_static_cap_factor=1.1,
+    thrust_static_cap_W_fraction=0.35,   # cap T at ≤ this * W (typ. 0.3–0.4)
+    altitude_m=0.0,
+    max_iter=40, tol=0.5
+):
+    """
+    Solve for wing area S so ground roll ≤ hard_constraints['takeoff_distance_max_m'].
+
+    Model: m dV/dt = T(V) - D(V,S) - μ (W - L(V,S)),  dx/dt = V
+           Stop when V ≥ 1.2 * Vs_flap (rotation criterion)
+
+    Returns (on convergence or best-effort):
+      {
+        "wing_area_m2": float,
+        "ground_roll_m": float,
+        "V_LOF_ms": float,
+        "CLmax_eff": float,
+        "CD0_eff": float,
+        "diag": {...}        # extra debugging info
+      }
+    """
+
+    g       = 9.81
+    rho     = get_air_density(altitude_m)
+    W       = cur["mtow"] * g
+    m       = W / g
+    ARw     = float(assumed_and_set.get("aspect_ratio", 12.0))
+    e_TO    = float(assumed_and_set.get("oswald_derated", 0.8))
+    mu_roll = float(assumed_and_set["rolling_resistance_coefficient"])
+
+    # Effective CLmax, CD0 at takeoff config (your helpers)
+    cl_pack  = effective_CLmax_partial_span(deflections_dict, phase_prefix="takeoff",
+                                            flap_deflection_deg=20,
+                                            flap_span_fraction=0.5,
+                                            spanwise_flap_effectiveness=0.95,
+                                            alpha_margin_deg=0.0)
+    cd0_pack = effective_CD0_partial_span(deflections_dict, phase_prefix="takeoff")
+
+    CLmax_eff = float(cl_pack["CLmax_eff"])
+    CD0_eff   = float(cd0_pack["CD0_eff"])
+
+    # Induced factor
+    k_ind = 1.0 / (math.pi * ARw * e_TO)
+
+    # Power & thrust model (takeoff)
+    eta_prop_TO = float(propeller_specs["efficiency"].get("takeoff",
+                           propeller_specs["efficiency"].get("take-off", 0.75)))
+    eta_gb   = float(engine_specs.get("gear_box_efficiency", 1.0))
+    P_avail  = float(engine_specs["max_power_kw"]) * 1000.0 * eta_prop_TO * eta_gb
+    T_cap_W  = thrust_static_cap_W_fraction * W  # absolute thrust cap vs. weight
+
+    s_target = float(hard_constraints["takeoff_distance_max_m"])
+
+    def ground_roll_for_S(Sw):
+        """
+        Forward integrate ground run for a given wing area Sw.
+        Uses optimal CL at each step: CL* = min(mu/(2k), CLmax_eff).
+        Returns (x_runway, V_LOF, info_dict) or (inf, V_LOF, info_dict) if infeasible.
+        """
+        # Stall/rotation speeds with flaps for this S
+        Vs    = math.sqrt(W / (0.5 * rho * Sw * CLmax_eff))
+        V_LOF = 1.2 * Vs
+
+        # Optimal CL for ground roll (bounded by CLmax)
+        CL_star = min(CLmax_eff, (mu_roll / (2.0 * k_ind)))
+
+        # Integrate
+        V   = 0.1   # m/s
+        x   = 0.0
+        dt  = 0.05  # s
+
+        # loose guard to avoid runaway loops
+        max_steps = int(max(2000, 5.0 * s_target / max(0.5, 0.3*V_LOF) / dt))
+
+        for _ in range(max_steps):
+            if V >= V_LOF:
+                return x, V_LOF, {"ok": True, "CL_star": CL_star, "steps": _}
+
+            q   = 0.5 * rho * V * V
+            CL  = CL_star
+            L   = q * Sw * CL
+            CD  = CD0_eff + k_ind * (CL * CL)
+            D   = q * Sw * CD
+            # Thrust limited by both P/V and static/low-speed cap
+            T_pv = P_avail / max(V, 1.0)
+            T    = min(T_pv, T_cap_W)
+
+            Fx   = T - D - mu_roll * (W - L)
+            if Fx <= 0.0:
+                # Physically infeasible with this Sw (no acceleration at this V)
+                return math.inf, V_LOF, {
+                    "ok": False, "reason": "Fx<=0", "V_ms": V, "q_Pa": q,
+                    "T_N": T, "D_N": D, "L_N": L, "mu": mu_roll,
+                    "W_N": W, "CD0": CD0_eff, "k": k_ind, "CL_star": CL_star
+                }
+
+            a = Fx / m
+            V += a * dt
+            x += V * dt
+
+            if x > 5.0 * s_target:
+                # Treat as infeasible for this S (won't reach rotation in reasonable distance)
+                return math.inf, V_LOF, {
+                    "ok": False, "reason": "x>5*s_target before V_LOF", "V_ms": V, "x_m": x
+                }
+
+        # Safety fallback
+        return math.inf, V_LOF, {"ok": False, "reason": "max_steps_exceeded"}
+
+    # ---- Solve for S with bracket + secant on f(S)=x(S)-s_target ----
+    # Initial bracket based on stall area
+    Vstall_req = kmh_to_ms(hard_constraints["stall_speed_kmh"])
+    S_stall    = W / (0.5 * get_air_density(0.0) * Vstall_req**2 * CLmax_eff)
+
+    S_lo = max(0.5, 0.5 * S_stall)
+    S_hi = 4.0 * S_lo
+
+    x_lo, Vlof_lo, _ = ground_roll_for_S(S_lo)
+    x_hi, Vlof_hi, _ = ground_roll_for_S(S_hi)
+
+    # Grow bracket until it straddles s_target (with guards)
+    guard = 0
+    while (x_lo > s_target) and guard < 12:
+        S_lo *= 1.2
+        x_lo, Vlof_lo, _ = ground_roll_for_S(S_lo)
+        guard += 1
+
+    guard = 0
+    while (x_hi < s_target) and guard < 12:
+        S_hi *= 1.5
+        x_hi, Vlof_hi, _ = ground_roll_for_S(S_hi)
+        guard += 1
+
+    S0, x0 = S_lo, x_lo
+    S1, x1 = S_hi, x_hi
+    V_LOF  = Vlof_hi
+
+    for _ in range(max_iter):
+        # Secant step (robustified)
+        if not np.isfinite(x0) or not np.isfinite(x1) or abs(x1 - x0) < 1e-6:
+            S_try = 0.5 * (S0 + S1)
+        else:
+            S_try = S1 + (s_target - x1) * (S1 - S0) / (x1 - x0)
+
+        # Limit step growth
+        S_try = float(np.clip(S_try, 0.5 * S_lo, 2.0 * S_hi))
+
+        x_try, V_LOF, _ = ground_roll_for_S(S_try)
+        if abs(x_try - s_target) < tol:
+            return {
+                "wing_area_m2": float(S_try),
+                "ground_roll_m": float(x_try),
+                "V_LOF_ms": float(V_LOF),
+                "CLmax_eff": CLmax_eff,
+                "CD0_eff": CD0_eff,
+                "diag": {"k_ind": k_ind, "mu_roll": mu_roll, "e_TO": e_TO, "AR": ARw}
+            }
+
+        # Update bracket for next secant
+        S0, x0 = S1, x1
+        S1, x1 = S_try, x_try
+
+    # Best-effort return
+    return {
+        "wing_area_m2": float(S1),
+        "ground_roll_m": float(x1),
+        "V_LOF_ms": float(V_LOF),
+        "CLmax_eff": CLmax_eff,
+        "CD0_eff": CD0_eff,
+        "diag": {"k_ind": k_ind, "mu_roll": mu_roll, "e_TO": e_TO, "AR": ARw, "note": "max_iter reached"}
+    }
+
+
 def wing_area_from_takeoff_distance(
     cur, assumed_and_set, hard_constraints,
     engine_specs, propeller_specs, deflections_dict,
@@ -1071,6 +1323,7 @@ def wing_area_from_takeoff_distance(
     )
 
     CLmax_eff = cl_pack["CLmax_eff"]
+    
     CD0_eff = cd0_pack["CD0_eff"]
 
     # Induced factor
@@ -1098,21 +1351,30 @@ def wing_area_from_takeoff_distance(
         V = 0.1  # m/s to avoid div by zero
         x = 0.0
         dt = 0.05
-        while V < V_LOF and x < 5 * s_target:
+        while V < V_LOF:
             q = 0.5 * rho * V**2
             L = q * Sw * CL_avg
             CD = CD0_eff + k_ind * (CL_avg**2)
+            
             D = q * Sw * CD
             T = min(P_avail_W / max(V, 1.0), T_cap)
-            a = (T - D - mu_roll * (W - L)) / m
-            a = max(a, 0.0)
+            Fx = (T - D - mu_roll * (W - L))
+
+            if Fx <= 0.0:
+                return math.inf, V_LOF  # infeasible
+            a =  Fx / m
+            
+            a = max(a, 0.1)
+            
             V += a * dt
             x += V * dt
+
         return x, V_LOF
 
     # Solve for S by simple bracket + secant on f(S)=x(S)-s_target
     # Bracket
     S_lo = max(0.5, W / (0.5 * rho * kmh_to_ms(hard_constraints["stall_speed_kmh"])**2 * CLmax_eff)) * 0.5
+    
     S_hi = S_lo * 4.0
     x_lo, _ = ground_roll_for_S(S_lo)
     x_hi, _ = ground_roll_for_S(S_hi)
@@ -1132,10 +1394,9 @@ def wing_area_from_takeoff_distance(
     x0, x1 = x_lo, x_hi
 
     for _ in range(max_iter):
-        if abs(x1 - x0) < 1e-6:
-            S_try = 0.5*(S0 + S1)
+        if not np.isfinite(x0) or not np.isfinite(x1) or abs(x1 - x0) < 1e-6:
+            S_try = 0.5 * (S0 + S1)
         else:
-            # secant
             S_try = S1 + (s_target - x1) * (S1 - S0) / (x1 - x0)
 
         S_try = max(S_lo*0.5, min(S_hi*2.0, S_try))
