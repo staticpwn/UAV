@@ -1287,7 +1287,7 @@ def wing_area_min_for_takeoff_limit(
             Fx = T - D - mu_roll * (W - L)
             if Fx <= 0.0:
                 return math.inf, V_LOF, {
-                    "feasible": False, "why": "Fx<=0", "CL_star": CL_star, "samples": samples
+                    "feasible": False, "why": "Fx<=0", "CL_star": CL_star, "samples": samples, "steps": steps
                 }
             a  = Fx / m
             V += a * dt
@@ -1330,10 +1330,12 @@ def wing_area_min_for_takeoff_limit(
 
     # If still infeasible even at big S → report best effort
     if not feasible_hi:
-        return {
+
+        return_dict = {
             "wing_area_m2": float(S_hi),
             "ground_roll_m": float(x_hi),
             "V_LOF_ms": float(Vlof_hi),
+            "ground_roll_duration": 0,
             "CLmax_eff": CLmax_eff,
             "CD0_eff": CD0_eff, 
             "diag": {
@@ -1345,15 +1347,20 @@ def wing_area_min_for_takeoff_limit(
                 "T_over_W_cap": T_over_W_cap
             }
         }
+        # print(return_dict)
+        return return_dict
 
     # Binary search: minimum feasible S
     it = 0
     best_S = S_hi
     best_x = x_hi
     best_Vlof = Vlof_hi
+    info_mid = {}
+    
     while (S_hi - S_lo) > S_tol and it < max_bisect_iter:
         S_mid = 0.5 * (S_lo + S_hi)
         x_mid, Vlof_mid, info_mid = ground_roll_for_S(S_mid)
+        # print(info_mid)
         if x_mid <= s_target:  # feasible → move high down
             best_S, best_x, best_Vlof = S_mid, x_mid, Vlof_mid
             S_hi = S_mid
@@ -1361,12 +1368,12 @@ def wing_area_min_for_takeoff_limit(
             S_lo = S_mid
         it += 1
 
-    return {
+    return_dict = {
         "wing_area_m2": float(best_S),
         "ground_roll_m": float(best_x),
         "ground_roll_duration": info_mid["steps"] * dt,
         "V_LOF_ms": float(best_Vlof),
-        "CLmax_eff": info_mid["CL_star"],
+        "CLmax_eff":  info_mid["CL_star"],
         "CD0_eff": CD0_eff,
         "diag": {
             "feasible": True,
@@ -1377,3 +1384,6 @@ def wing_area_min_for_takeoff_limit(
             "T_over_W_cap": T_over_W_cap
         }
     }
+
+    # print(return_dict)
+    return return_dict
