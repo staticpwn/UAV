@@ -96,7 +96,7 @@ startupinfo = subprocess.STARTUPINFO()
 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 startupinfo.wShowWindow = 0  # SW_HIDE
 
-def get_airfoil_params_with_flap_effect_naca(airfoil_name, Reynolds_numbers, deflection_angles, phases, output_dir="ht_deflections"):
+def get_airfoil_params_with_flap_effect_naca(airfoil_name, Reynolds_numbers, deflection_angles, phases, output_dir="ht_deflections", alpha_sweep=(-15,25)):
     """
     Run XFOIL using built-in NACA airfoil with flap deflections at different Re.
     
@@ -142,7 +142,7 @@ def get_airfoil_params_with_flap_effect_naca(airfoil_name, Reynolds_numbers, def
             PACC
             {output_polar}
             
-            ASEQ -12 0 0.5           ! Alpha sweep: -5 to +15 deg, 0.5 deg step
+            ASEQ {alpha_sweep[0]} {alpha_sweep[1]} 0.5           ! Alpha sweep: -5 to +15 deg, 0.5 deg step
             QUIT
             """.strip()
 
