@@ -529,7 +529,7 @@ def get_cl_alpha_at(df, alpha, target_coeff, delta=0.5):
     df = df.sort_values("alpha")
 
     alpha_min = -15
-    alpha_max = 25
+    alpha_max = 30
 
     if not (alpha_min <= alpha - delta and alpha + delta <= alpha_max):
         raise ValueError(f"Alpha ± delta must be within data bounds ({alpha_min} to {alpha_max})")
