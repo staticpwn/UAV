@@ -244,96 +244,6 @@ def wing_fuel_tank_volume(file_path, iterable_constraints, front_spar_pos, rear_
     return reduction_margin*tank_volume_m3
     
 
-def calculate_Cn_beta_phase(current_values, hard_constraints, vt_airfoil_data, phase):
-    """
-    Compute Cn_beta for a given phase.
-    """
-    # Geometry
-    S_wing = current_values["wing_area_m2"]
-    b_wing = current_values["wing_span_m"]
-    S_vt = current_values["vertical_tail_area_m2"]
-    l_v = current_values["tail_arm_m"]
-    c_vt = current_values["v_tail_chord_m"]
-    cg_nose = current_values[f"{phase}_cg_from_nose_m"]
-    wing_le_position = current_values["wing_le_position_m"]
-    chord = current_values["chord_m"]
-
-    # VT AC position
-    vt_ac = cg_nose + l_v + 0.25 * c_vt
-    wing_ac = wing_le_position + 0.25 * chord
-    l_v_ac = vt_ac - wing_ac  # moment arm
-
-    # Vertical tail volume coefficient
-    Vv = (S_vt * l_v_ac) / (S_wing * b_wing)
-
-    # Flight condition
-    alt = hard_constraints["cruise_altitude_m"]
-    speed_kmh = current_values[f"{phase}_speed_kmh"]
-    Re_vt = calculate_reynolds_number(speed_kmh, c_vt, alt)
-
-    # Interpolate airfoil data at Re
-
-    airfoil_at_Re = vt_airfoil_data  # fallback
-
-    cl_alpha_vt_per_deg = get_cl_alpha_at(airfoil_at_Re, 0, "CL",delta=0.1)
-    cl_alpha_vt_per_rad = cl_alpha_vt_per_deg * (180 / np.pi)
-
-    # Downwash/shielding factor
-    eta_v = calculate_eta_h(current_values, phase)  # assume clean airflow; adjust if needed
-
-    # Cn_beta from vertical tail
-    Cn_beta_vt = Vv * cl_alpha_vt_per_rad * eta_v
-
-    # Fuselage contribution (negative)
-    fuselage_length = current_values["fuselage_body_length_m"]
-    nose_ahead_cg = cg_nose
-    Cn_beta_fus = -0.003 * nose_ahead_cg  # empirical per meter
-
-    # Total
-    Cn_beta = Cn_beta_vt + Cn_beta_fus
-
-    return {
-        f"{phase}_Cn_beta": Cn_beta,
-        f"{phase}_Re_vt": Re_vt,
-    }
-
-def calculate_Cl_beta_phase(current_values, assumed_and_set, phase):
-    """
-    Compute Cl_beta for a given phase.
-    """
-    # Geometry
-    b_wing = current_values["wing_span_m"]
-    S_wing = current_values["wing_area_m2"]
-    AR = assumed_and_set["aspect_ratio"]
-
-    # Design parameters (from assumed_and_set or defaults)
-    dihedral_deg = assumed_and_set.get("dihedral_deg", 0.0)
-    wing_sweep_deg = assumed_and_set.get("wing_sweep_deg", 0.0)
-    high_wing_offset_m = current_values.get("high_wing_offset_m", 0.0)
-
-    # Flight condition
-    cl = current_values[f"{phase}_cl"]
-
-    # Dihedral effect (empirical)
-    Cl_beta_dihedral = -0.02 * dihedral_deg * (1 + 0.2 * cl) # per degree dihedral
-
-    # Sweep contribution (approx: 1° sweep ≈ 0.7° dihedral)
-    Cl_beta_sweep = -0.014 * wing_sweep_deg
-
-    # High-wing offset (pendulum effect)
-    if high_wing_offset_m > 0:
-        Cl_beta_high_wing = -0.002 * high_wing_offset_m * (b_wing / 2)  # approx
-    else:
-        Cl_beta_high_wing = 0.0
-
-    # Total Cl_beta
-    Cl_beta = Cl_beta_dihedral + Cl_beta_sweep + Cl_beta_high_wing
-
-    return {
-        f"{phase}_Cl_beta": Cl_beta,
-    }
-
-
 def size_fuselage_diameter_as_per_payload(internal_payload_count, internal_payload_diameter):
     n = internal_payload_count     # number of cylinders
     d = internal_payload_diameter  # cylinder diameter (m)
@@ -470,6 +380,192 @@ def get_wing_or_tail_mass(surface_area, assumed_and_set, tail_or_wing):
 
 
 
+# ---- Shared helper from earlier (3D slope for VT & Wing) ----
+def _a_3D_per_rad(cur, assumed, hard, phase,
+                  sweep_quarter_deg, a0_2D_per_rad=2.0*np.pi, e=0.95):
+
+    
+
+    if phase in ["takeoff", "climb"]:
+        altitude = 0
+    else:
+        altitude = hard["cruise_altitude_m"]
+
+    mach = atm.mach(kmh_to_ms(cur[f"{phase}_speed_kmh"]), altitude)[0]
+    AR_v = assumed["AR_vertical"]
+
+    """DATCOM-style 3D lift-curve slope (per rad)."""
+    beta_M = max(np.sqrt(max(1.0 - mach**2, 1e-6)), 1e-3)
+    cosL = np.cos(np.deg2rad(sweep_quarter_deg))
+    num = a0_2D_per_rad * beta_M * cosL
+    den = 1.0 + (a0_2D_per_rad * beta_M * cosL) / (np.pi * max(e,1e-3) * max(AR_v,1e-3))
+    return float(num / max(den, 1e-6))
+
+def compute_Cl_beta(
+    cur, assumed, hard, phase="cruiseout",
+    # Vertical tail factors
+    k_v_interference=0.95, eta_v=1.00, sidewash_factor=0.90,  # same meaning as for Cn_beta
+    e_v=0.95,e_w=0.95,
+    # Wing effective dihedral factors
+    k_eff_dihedral=0.50,          # blends true dihedral + “placement” into effective dihedral
+    k_highwing=1.00,              # multiplier for high-wing placement effect
+    # Keel (fuselage) factor
+    k_keel=2.0,                   # tunable: strength of keel moment from side area above CG
+    # Geometry references (heights)
+    z_ref_is_floor=True           # your z’s are referenced from floor; CG given as *_cg_from_floor_m
+):
+    """
+    Returns {f"{phase}_Cl_beta": value} (per rad).
+    Sign convention: negative Cl_beta is stabilizing (right wind -> rolls left).
+    """
+    # Wing refs
+    S = float(cur["wing_area_m2"])
+    b = float(cur["wing_span_m"])
+    sweep_w_deg = float(assumed.get("wing_sweep_deg", 0.0))
+    sweep_v_deg = float(assumed.get("sweep_v_deg", 0.0))
+    dihedral_deg = float(assumed.get("dihedral_deg", 0.0))
+
+    # Phase CG height above floor and CG lateral/vertical reference
+    z_cg = float(cur.get(f"{phase}_cg_from_floor_m", cur.get("cruiseout_cg_from_floor_m", 0.0)))
+    h_fus = float(cur.get("fuselage_body_height_m", 0.0))
+    z_mid_fus = 0.5 * h_fus if z_ref_is_floor else 0.0
+
+    # ---------- 1) Vertical tail contribution (dominant) ----------
+    # VT centroid height above CG
+    # Approximate VT centroid z: fuselage mid-height + pylon + 0.5 * VT span
+    z_vt_centroid = z_mid_fus  + 0.5*float(cur["v_tail_span_m"])
+    z_v = z_vt_centroid - z_cg                   # lever arm for VT sideforce
+    
+    # Mach estimate if not supplied
+    if phase in ["takeoff", "climb"]:
+        altitude = 0
+    else:
+        altitude = hard["cruise_altitude_m"]
+
+    mach = atm.mach(kmh_to_ms(cur[f"{phase}_speed_kmh"]), altitude)[0]
+
+    a_v = _a_3D_per_rad(cur, assumed, hard, phase, sweep_quarter_deg = sweep_v_deg, a0_2D_per_rad=2*np.pi, e=e_v)
+    vt_gain = k_v_interference * eta_v * sidewash_factor
+    Sv_over_S = float(cur["vertical_tail_area_m2"]) / S
+    Cl_beta_vt = - vt_gain * Sv_over_S * (z_v / b) * a_v
+
+    # ---------- 2) Wing “effective dihedral” contribution ----------
+    # True dihedral (deg) + placement effect (high wing behaves like extra dihedral).
+    # Estimate wing vertical offset relative to CG:
+    z_wing_ref = z_mid_fus + float(cur.get("high_wing_offset_m", 0.0))
+    z_w = z_wing_ref - z_cg
+    # Effective dihedral (rad): true dihedral + k * (z_w/b) converted to equivalent radians
+    dihedral_eff_rad = np.deg2rad(dihedral_deg) + k_eff_dihedral * k_highwing * (z_w / max(b,1e-6))
+    # Wing lift-curve slope (per rad)
+    a_w = _a_3D_per_rad(cur, assumed, hard, phase, sweep_quarter_deg = sweep_w_deg, a0_2D_per_rad=2*np.pi, e=e_w)
+    # Wing contribution magnitude ~ a_w * dihedral_eff (dimensionless); scaled mildly by span efficiency.
+    # Add a shape factor (~0.5) to keep in known ranges for straight rectangular wings.
+    Cl_beta_wing = - 0.5 * a_w * dihedral_eff_rad
+
+    # ---------- 3) Keel (fuselage side area) contribution ----------
+    A_side = float(cur.get("fuselage_body_height_m", 0.0)) * float(cur.get("fuselage_body_length_m", 0.0))
+    # Vertical centroid of side area relative to CG (approx at fuselage mid-height)
+    z_keel = (z_mid_fus - z_cg)
+    Cl_beta_keel = - k_keel * (A_side / (S * b)) * z_keel   # negative if area centroid is above CG
+
+    # ---------- Sum ----------
+    Cl_beta_total = float(Cl_beta_vt + Cl_beta_wing + Cl_beta_keel)
+
+    # return {
+    #     f"{phase}_Cl_beta": Cl_beta_total,
+    #     f"{phase}_Cl_beta_breakdown": {
+    #         "Cl_beta_vt": float(Cl_beta_vt),
+    #         "Cl_beta_wing": float(Cl_beta_wing),
+    #         "Cl_beta_keel": float(Cl_beta_keel),
+    #         "a_v_per_rad": float(a_v),
+    #         "a_w_per_rad": float(a_w),
+    #         "dihedral_eff_rad": float(dihedral_eff_rad),
+    #         "z_v_over_b": float(z_v / b),
+    #         "z_w_over_b": float(z_w / b),
+    #         "A_side_over_Sb": float(A_side / (S * b)),
+    #         "mach": float(mach),
+    #     }
+    # }
+
+    return Cl_beta_total
+
+
+# ---------- Utilities ----------
+
+def _deg2rad(x): return x * np.pi / 180.0
+
+def vt_lift_slope_analytic_per_rad(current_values, assumed, hard, phase,
+                                   a0_2D_per_rad=2.0*np.pi, e=0.95):
+    """
+    Analytic VT lift-curve slope (per rad) with simple DATCOM-style corrections.
+    a = a0 * beta * cosΛ / [ 1 + (a0 * beta * cosΛ)/(π * e * AR) ]
+    where beta = sqrt(1 - M^2). Use quarter-chord sweep.
+    """
+    sweep_quarter_deg = assumed["wing_sweep_deg"]
+
+    if phase in ["takeoff", "climb"]:
+        altitude = 0
+    else:
+        altitude = hard["cruise_altitude_m"]
+
+    mach = atm.mach(kmh_to_ms(current_values[f"{phase}_speed_kmh"]), altitude)[0]
+    AR_v = assumed["AR_vertical"]
+
+    beta_M = max(np.sqrt(max(1.0 - mach**2, 1e-6)), 1e-3)
+    cosL = np.cos(_deg2rad(sweep_quarter_deg))
+    num = a0_2D_per_rad * beta_M * cosL
+    den = 1.0 + (a0_2D_per_rad * beta_M * cosL) / (np.pi * max(e, 1e-3) * max(AR_v, 1e-3))
+    return float(num / max(den, 1e-6))  # per rad
+
+
+# ---------- Main Cn_beta ----------
+
+def compute_Cn_beta(
+    cur, assumed, hard,
+    phase="cruiseout",
+    # Geometry / flow factors
+    k_v_interference=0.95,           # wing/fuselage interference on VT lift
+    eta_v=1.00,                      # q_tail / q_free; <1 if shadowed
+    sidewash_factor=0.90,            # beta_eff = sidewash_factor * beta (≈ 0.85–0.95 typical)
+    fuselage_side_area_m2=None, k_fus=-0.020
+):
+    """
+    Returns dict with {f"{phase}_Cn_beta": value} where value is per radian.
+
+    Model:
+      Cn_beta ≈ (k_v * eta_v * sidewash_factor) * (Sv * lv)/(S * b) * a_v  +  Cn_beta_fuselage
+
+      a_v from VT polars if available; otherwise analytic with AR/sweep/Mach corrections.
+      Cn_beta_fuselage ≈ k_fus * (A_side / S). Sign should be negative (destabilizing).
+    """
+    # Wing refs
+    S  = float(cur["wing_area_m2"])
+    b  = float(cur["wing_span_m"])
+
+    # Vertical tail geom
+    Sv = float(cur["vertical_tail_area_m2"])
+    lv = float(cur.get("tail_arm_m", 0.0))  # CG→VT AC yaw arm; use your best estimate or stored value
+
+    a_v = vt_lift_slope_analytic_per_rad(cur, assumed, hard, phase)
+
+    # VT contribution
+    vt_gain = (k_v_interference * eta_v * sidewash_factor)
+    Cn_beta_vt = vt_gain * (Sv * lv) / (S * b) * a_v
+
+
+    # Fuselage side area
+    if fuselage_side_area_m2 is None:
+        h = float(cur.get("fuselage_body_height_m", 0.0))
+        L = float(cur.get("fuselage_body_length_m", 0.0))
+        A_side = h * L
+    else:
+        A_side = float(fuselage_side_area_m2)
+
+    Cn_beta_fus = float(k_fus) * (A_side / S)
+
+
+    # return {f"{phase}_Cn_beta": float(Cn_beta_vt + Cn_beta_fus)}
+    return float(Cn_beta_vt + Cn_beta_fus)
 
 def get_coefficients_at_ht_deflection(ht_deflection_angle, effective_angle_of_attack, dict_of_deflection_frames, phase):
     deflection_angles_array = np.array(range(-15,31,1))
